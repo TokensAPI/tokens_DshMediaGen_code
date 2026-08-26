@@ -1,0 +1,5 @@
+# Register @tokens/dsh-media-gen with schema defaults.
+# Override outputDir, default models, or polling settings per machine when needed.
+- insert:
+    - id: media-gen
+      name: '@tokens/dsh-media-gen'
