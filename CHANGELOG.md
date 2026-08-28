@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Added a compact in-image download icon to generated and edited image result cards.
+- Reused the existing restricted same-origin download route for TokensAPI S3 images and direct Blob downloads for conversation attachments.
+- Added a client-bundle regression test to prevent the image download action from disappearing from future releases.
+
 ## 0.3.1
 
 - Fixed the web client bundle to register `@tokensapi/dsh-media-gen`, matching the published package name and preventing Harness plugin-loader startup failures.

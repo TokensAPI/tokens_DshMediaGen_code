@@ -18,3 +18,11 @@ test('client bundle registers the published package name', async () => {
   assert.equal(pkg.name, '@tokensapi/dsh-media-gen')
   assert.match(client, /window\.__ModuleLoader__\.load\(\{\s*id: '@tokensapi\/dsh-media-gen'/)
 })
+
+test('client bundle exposes per-image downloads through the safe host route', async () => {
+  const client = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+  assert.match(client, /\/media-gen\/download\?url=/)
+  assert.match(client, /'aria-label': '下载图片'/)
+  assert.match(client, /M12 3v11m0 0 4-4/)
+  assert.match(client, /download: filename/)
+})
