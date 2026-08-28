@@ -1,10 +1,58 @@
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { createHash, createHmac } from 'node:crypto'
 import type { MediaConfig } from './types.js'
-import { resultUrls } from '../shared/media.js'
+import { extensionForMediaType, resultUrls } from '../shared/media.js'
 
 export interface TokensContext {
   credentials: { resolve(ref: unknown): Promise<{ value?: string } | undefined> }
   logger: { warn(format: string, ...args: unknown[]): void }
+}
+
+function sha256Hex(data: Uint8Array | string): string {
+  return createHash('sha256').update(data).digest('hex')
+}
+
+function hmacSha256(key: Uint8Array | string, data: string): Buffer {
+  return createHmac('sha256', key).update(data).digest()
+}
+
+function signS3V4(options: {
+  method: string
+  path: string
+  host: string
+  contentType: string
+  payload: Uint8Array
+  accessKeyId: string
+  secretAccessKey: string
+  region: string
+  acl?: string
+}): { amzDate: string; payloadHash: string; authorization: string } {
+  const now = new Date()
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '')
+  const dateStamp = amzDate.slice(0, 8)
+  const payloadHash = sha256Hex(options.payload)
+  const headerEntries: Array<[string, string]> = [
+    ['content-type', options.contentType],
+    ['host', options.host],
+    ['x-amz-content-sha256', payloadHash],
+    ['x-amz-date', amzDate],
+  ]
+  if (options.acl) headerEntries.push(['x-amz-acl', options.acl])
+  const canonicalHeaders = headerEntries.map(([key, value]) => `${key}:${value}\n`).join('')
+  const signedHeaders = headerEntries.map(([key]) => key).join(';')
+  const canonicalRequest = [options.method, options.path, '', canonicalHeaders, signedHeaders, payloadHash].join('\n')
+  const scope = `${dateStamp}/${options.region}/s3/aws4_request`
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256Hex(canonicalRequest)].join('\n')
+  const kDate = hmacSha256(`AWS4${options.secretAccessKey}`, dateStamp)
+  const kRegion = hmacSha256(kDate, options.region)
+  const kService = hmacSha256(kRegion, 's3')
+  const kSigning = hmacSha256(kService, 'aws4_request')
+  const signature = hmacSha256(kSigning, stringToSign).toString('hex')
+  return {
+    amzDate,
+    payloadHash,
+    authorization: `AWS4-HMAC-SHA256 Credential=${options.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+  }
 }
 
 export class TokensApiClient {
@@ -21,6 +69,7 @@ export class TokensApiClient {
   }
 
   async uploadImage(dataUrl: string, signal?: AbortSignal): Promise<string> {
+    if (this.config.storageBackend === 'r2') return this.uploadImageR2(dataUrl, signal)
     if (!this.config.imageUploadURL) throw new Error('TokensAPI presign URL is not configured.')
     if (this.config.uploadAuthMode === 'account' && !this.config.accountUserId.trim()) {
       throw new Error('accountUserId is required for account-authenticated TokensAPI image upload.')
@@ -72,6 +121,57 @@ export class TokensApiClient {
     })
     if (!uploadResponse.ok) throw new Error(`TokensAPI object upload failed (${uploadResponse.status}): ${uploadResponse.statusText}`)
     return accessUrl
+  }
+
+  private async uploadImageR2(dataUrl: string, signal?: AbortSignal): Promise<string> {
+    const requiredFields: Array<keyof MediaConfig> = ['r2Endpoint', 'r2Bucket', 'r2CdnBase']
+    for (const field of requiredFields) {
+      if (!String(this.config[field] ?? '').trim()) throw new Error(`${field} is required for R2/S3 image upload.`)
+    }
+    const match = dataUrl.match(/^data:([^;,]+);base64,(.*)$/s)
+    if (!match) throw new Error('R2/S3 image upload requires a base64 Data URL.')
+    const mediaType = match[1] ?? 'image/png'
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mediaType)) {
+      throw new Error(`R2/S3 upload does not support ${mediaType}.`)
+    }
+    const bytes = Buffer.from(match[2] ?? '', 'base64')
+    if (bytes.length === 0 || bytes.length > 30 * 1024 * 1024) throw new Error('R2/S3 image upload size must be between 1 byte and 30 MB.')
+    const endpoint = new URL(this.config.r2Endpoint.trim())
+    const bucket = this.config.r2Bucket.trim().replace(/^\/+|\/+$/g, '')
+    const prefix = this.config.r2PathPrefix.trim().replace(/^\/+|\/+$/g, '')
+    const extension = extensionForMediaType(mediaType)
+    const objectKey = `${prefix ? `${prefix}/` : ''}dsh-media-${Date.now()}-${Math.random().toString(36).slice(2, 10)}${extension}`
+    const encodedKey = objectKey.split('/').map((segment) => encodeURIComponent(segment)).join('/')
+    const path = `/${bucket}/${encodedKey}`
+    const accessKeyId = await this.key(this.config.r2AccessKeyEnv)
+    const secretAccessKey = await this.key(this.config.r2SecretKeyEnv)
+    const signed = signS3V4({
+      method: 'PUT',
+      path,
+      host: endpoint.host,
+      contentType: mediaType,
+      payload: bytes,
+      accessKeyId,
+      secretAccessKey,
+      region: this.config.r2Region.trim() || 'auto',
+    })
+    const uploadResponse = await fetch(`https://${endpoint.host}${path}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': mediaType,
+        'x-amz-content-sha256': signed.payloadHash,
+        'x-amz-date': signed.amzDate,
+        Authorization: signed.authorization,
+      },
+      body: bytes,
+      signal,
+    })
+    if (!uploadResponse.ok) {
+      const detail = await uploadResponse.text().catch(() => '')
+      throw new Error(`R2/S3 object upload failed (${uploadResponse.status}): ${detail || uploadResponse.statusText}`)
+    }
+    const cdnBase = this.config.r2CdnBase.trim().replace(/\/+$/, '')
+    return `${cdnBase}/${objectKey}`
   }
 
   async submit(kind: 'images' | 'videos', body: Record<string, unknown>, signal?: AbortSignal): Promise<string> {

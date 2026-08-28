@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { createReadStream } from "node:fs";
 import { stat as stat3 } from "node:fs/promises";
 import { join as join2 } from "node:path";
+import { Readable } from "node:stream";
 
 // src/shared/media.ts
 import { readFile, stat } from "node:fs/promises";
@@ -168,6 +169,42 @@ async function saveVideo(url, taskId, config, signal) {
 
 // src/host/tokensapi.ts
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
+import { createHash, createHmac } from "node:crypto";
+function sha256Hex(data) {
+  return createHash("sha256").update(data).digest("hex");
+}
+function hmacSha256(key, data) {
+  return createHmac("sha256", key).update(data).digest();
+}
+function signS3V4(options) {
+  const now = /* @__PURE__ */ new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = sha256Hex(options.payload);
+  const headerEntries = [
+    ["content-type", options.contentType],
+    ["host", options.host],
+    ["x-amz-content-sha256", payloadHash],
+    ["x-amz-date", amzDate]
+  ];
+  if (options.acl) headerEntries.push(["x-amz-acl", options.acl]);
+  const canonicalHeaders = headerEntries.map(([key, value]) => `${key}:${value}
+`).join("");
+  const signedHeaders = headerEntries.map(([key]) => key).join(";");
+  const canonicalRequest = [options.method, options.path, "", canonicalHeaders, signedHeaders, payloadHash].join("\n");
+  const scope = `${dateStamp}/${options.region}/s3/aws4_request`;
+  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
+  const kDate = hmacSha256(`AWS4${options.secretAccessKey}`, dateStamp);
+  const kRegion = hmacSha256(kDate, options.region);
+  const kService = hmacSha256(kRegion, "s3");
+  const kSigning = hmacSha256(kService, "aws4_request");
+  const signature = hmacSha256(kSigning, stringToSign).toString("hex");
+  return {
+    amzDate,
+    payloadHash,
+    authorization: `AWS4-HMAC-SHA256 Credential=${options.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+  };
+}
 var TokensApiClient = class {
   constructor(ctx, config) {
     this.ctx = ctx;
@@ -182,6 +219,7 @@ var TokensApiClient = class {
     return `dsh-media-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }
   async uploadImage(dataUrl, signal) {
+    if (this.config.storageBackend === "r2") return this.uploadImageR2(dataUrl, signal);
     if (!this.config.imageUploadURL) throw new Error("TokensAPI presign URL is not configured.");
     if (this.config.uploadAuthMode === "account" && !this.config.accountUserId.trim()) {
       throw new Error("accountUserId is required for account-authenticated TokensAPI image upload.");
@@ -227,6 +265,56 @@ var TokensApiClient = class {
     });
     if (!uploadResponse.ok) throw new Error(`TokensAPI object upload failed (${uploadResponse.status}): ${uploadResponse.statusText}`);
     return accessUrl;
+  }
+  async uploadImageR2(dataUrl, signal) {
+    const requiredFields = ["r2Endpoint", "r2Bucket", "r2CdnBase"];
+    for (const field of requiredFields) {
+      if (!String(this.config[field] ?? "").trim()) throw new Error(`${field} is required for R2/S3 image upload.`);
+    }
+    const match = dataUrl.match(/^data:([^;,]+);base64,(.*)$/s);
+    if (!match) throw new Error("R2/S3 image upload requires a base64 Data URL.");
+    const mediaType = match[1] ?? "image/png";
+    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mediaType)) {
+      throw new Error(`R2/S3 upload does not support ${mediaType}.`);
+    }
+    const bytes = Buffer.from(match[2] ?? "", "base64");
+    if (bytes.length === 0 || bytes.length > 30 * 1024 * 1024) throw new Error("R2/S3 image upload size must be between 1 byte and 30 MB.");
+    const endpoint = new URL(this.config.r2Endpoint.trim());
+    const bucket = this.config.r2Bucket.trim().replace(/^\/+|\/+$/g, "");
+    const prefix = this.config.r2PathPrefix.trim().replace(/^\/+|\/+$/g, "");
+    const extension = extensionForMediaType(mediaType);
+    const objectKey = `${prefix ? `${prefix}/` : ""}dsh-media-${Date.now()}-${Math.random().toString(36).slice(2, 10)}${extension}`;
+    const encodedKey = objectKey.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+    const path = `/${bucket}/${encodedKey}`;
+    const accessKeyId = await this.key(this.config.r2AccessKeyEnv);
+    const secretAccessKey = await this.key(this.config.r2SecretKeyEnv);
+    const signed = signS3V4({
+      method: "PUT",
+      path,
+      host: endpoint.host,
+      contentType: mediaType,
+      payload: bytes,
+      accessKeyId,
+      secretAccessKey,
+      region: this.config.r2Region.trim() || "auto"
+    });
+    const uploadResponse = await fetch(`https://${endpoint.host}${path}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": mediaType,
+        "x-amz-content-sha256": signed.payloadHash,
+        "x-amz-date": signed.amzDate,
+        Authorization: signed.authorization
+      },
+      body: bytes,
+      signal
+    });
+    if (!uploadResponse.ok) {
+      const detail = await uploadResponse.text().catch(() => "");
+      throw new Error(`R2/S3 object upload failed (${uploadResponse.status}): ${detail || uploadResponse.statusText}`);
+    }
+    const cdnBase = this.config.r2CdnBase.trim().replace(/\/+$/, "");
+    return `${cdnBase}/${objectKey}`;
   }
   async submit(kind, body, signal) {
     const response = await fetch(`${this.config.baseURL}/tasks/${kind}`, {
@@ -334,9 +422,76 @@ var Config = Schema.object({
   imageUploadURL: Schema.string().default("https://tokensapi.ai/api/aigc/presign"),
   uploadAuthMode: Schema.union(["account", "api_key"]).default("account"),
   accountAccessTokenEnv: Schema.string().role("credential-ref").default("TOKENSAPI_ACCOUNT_ACCESS_TOKEN"),
-  accountUserId: Schema.string().default("")
+  accountUserId: Schema.string().default(""),
+  storageBackend: Schema.union(["presign", "r2"]).default("presign"),
+  r2Endpoint: Schema.string().default(""),
+  r2Region: Schema.string().default("auto"),
+  r2AccessKeyEnv: Schema.string().role("credential-ref").default("R2_ACCESS_KEY_ID"),
+  r2SecretKeyEnv: Schema.string().role("credential-ref").default("R2_SECRET_ACCESS_KEY"),
+  r2Bucket: Schema.string().default(""),
+  r2CdnBase: Schema.string().default(""),
+  r2PathPrefix: Schema.string().default("inputs")
 });
 var VIDEO_ROUTE_PREFIX = "/media-gen/videos";
+var DOWNLOAD_ROUTE = "/media-gen/download";
+function safeDownloadName(url, requestedName) {
+  const fallback = url.pathname.split("/").pop() || "media-download";
+  const value = String(requestedName || fallback).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 160);
+  return value || "media-download";
+}
+function registerDownloadRoute(ctx) {
+  ctx.effect(() => ctx.webServer.register({
+    kind: "exact",
+    path: DOWNLOAD_ROUTE,
+    async handler(req, res) {
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.writeHead(405, { Allow: "GET, HEAD" });
+        res.end();
+        return;
+      }
+      let source;
+      let filename;
+      try {
+        const requestUrl = new URL(req.url ?? DOWNLOAD_ROUTE, "http://dsh.local");
+        source = new URL(requestUrl.searchParams.get("url") || "");
+        filename = safeDownloadName(source, requestUrl.searchParams.get("name"));
+      } catch {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+      if (source.protocol !== "https:" || source.hostname !== "s3.tokensapi.ai") {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+      try {
+        const response = await fetch(source);
+        if (!response.ok || !response.body) {
+          res.writeHead(response.status || 502);
+          res.end();
+          return;
+        }
+        const headers = {
+          "Content-Type": response.headers.get("content-type") || "application/octet-stream",
+          "Content-Disposition": `attachment; filename="${filename}"`,
+          "Cache-Control": "private, max-age=300"
+        };
+        const length = response.headers.get("content-length");
+        if (length) headers["Content-Length"] = length;
+        res.writeHead(200, headers);
+        if (req.method === "HEAD") {
+          res.end();
+          return;
+        }
+        Readable.fromWeb(response.body).pipe(res);
+      } catch {
+        res.writeHead(502);
+        res.end();
+      }
+    }
+  }), "media-gen: explicit download route");
+}
 function parseRange(value, size) {
   if (!value) return null;
   const match = value.match(/^bytes=(\d*)-(\d*)$/);
@@ -437,6 +592,116 @@ async function ask(ctx, exec, questions) {
   const response = await ctx.userQuestions.ask({ questions, ...exec.agent ? { agent: exec.agent } : {}, signal: exec.signal });
   return Object.fromEntries((response.answers ?? []).map((answer) => [answer.id, answer]));
 }
+function sessionUserImageRefs(exec) {
+  const messages = exec.agent?.session?.deriveMessages?.() ?? [];
+  const refs = [];
+  for (const message of messages) {
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block?.type !== "image" || !block.attachment || typeof block.attachment !== "object") continue;
+      if (typeof block.attachment.attachmentId !== "string") continue;
+      refs.push(block.attachment);
+    }
+  }
+  return refs;
+}
+function resolveSessionImageRef(exec, selector) {
+  const refs = sessionUserImageRefs(exec);
+  if (refs.length === 0) return null;
+  if (!selector || selector === "latest") return refs.at(-1) ?? null;
+  if (selector === "first") return refs[0] ?? null;
+  if (selector === "last") return refs.at(-1) ?? null;
+  const ordinal = /^(?:index:)?(\d+)$/.exec(selector);
+  if (ordinal) {
+    const position = Number(ordinal[1]);
+    if (!Number.isSafeInteger(position) || position < 1) return null;
+    return refs[position - 1] ?? null;
+  }
+  const attachmentId = selector.startsWith("sha256:") ? selector : `sha256:${selector}`;
+  for (let index = refs.length - 1; index >= 0; index -= 1) {
+    if (refs[index]?.attachmentId === attachmentId) return refs[index] ?? null;
+  }
+  return null;
+}
+function describeSessionImageSelector(selector) {
+  if (!selector || selector === "latest" || selector === "last") return "\u5F53\u524D\u5BF9\u8BDD\u6700\u8FD1\u4E00\u5F20\u7528\u6237\u4E0A\u4F20\u56FE\u7247";
+  if (selector === "first") return "\u5F53\u524D\u5BF9\u8BDD\u7B2C 1 \u5F20\u7528\u6237\u4E0A\u4F20\u56FE\u7247";
+  const ordinal = /^(?:index:)?(\d+)$/.exec(selector);
+  if (ordinal) return `\u5F53\u524D\u5BF9\u8BDD\u7B2C ${Number(ordinal[1])} \u5F20\u7528\u6237\u4E0A\u4F20\u56FE\u7247`;
+  return `\u5F53\u524D\u5BF9\u8BDD\u9644\u4EF6 ${selector}`;
+}
+function describeImageInput(input) {
+  const value = String(input ?? "");
+  if (!value.startsWith("dsh-attachment:")) return value;
+  return describeSessionImageSelector(value.slice("dsh-attachment:".length).trim() || "latest");
+}
+function supportedModelsForIntent(intent) {
+  return intent === "video_gen" ? VIDEO_MODELS : intent === "image_edit" ? IMAGE_EDIT_MODELS : IMAGE_MODELS;
+}
+function defaultModelForIntent(intent, config) {
+  return intent === "video_gen" ? config.defaultVideoModel : intent === "image_edit" ? config.defaultEditModel : config.defaultImageModel;
+}
+function trimOptionalString(params, key) {
+  if (params[key] === void 0) return;
+  if (typeof params[key] !== "string") throw new Error(`${key} must be a string.`);
+  const value = params[key].trim();
+  if (value) params[key] = value;
+  else delete params[key];
+}
+function normalizeWizardKnown(intent, known, exec) {
+  if (known !== void 0 && (known === null || typeof known !== "object" || Array.isArray(known))) {
+    throw new Error("known must be an object.");
+  }
+  const params = { ...known ?? {} };
+  delete params.modelExplicit;
+  for (const key of ["prompt", "originalPrompt", "promptSource", "model", "image", "aspect_ratio", "resolution", "image_url", "start_image", "end_image"]) {
+    trimOptionalString(params, key);
+  }
+  if (intent === "image_edit" && !params.image && sessionUserImageRefs(exec).length === 1) params.image = "dsh-attachment:latest";
+  if (params.promptSource !== void 0 && !["user", "inferred", "wizard"].includes(params.promptSource)) {
+    throw new Error("promptSource must be user, inferred, or wizard.");
+  }
+  for (const key of ["enhanced", "useDefaultModel", "skipFinalConfirmation"]) {
+    if (params[key] !== void 0 && typeof params[key] !== "boolean") throw new Error(`${key} must be a boolean.`);
+  }
+  for (const key of ["n", "duration"]) {
+    if (params[key] !== void 0 && (!Number.isInteger(params[key]) || params[key] <= 0)) throw new Error(`${key} must be a positive integer.`);
+  }
+  if (params.reference_images !== void 0) {
+    if (!Array.isArray(params.reference_images) || params.reference_images.some((value) => typeof value !== "string" || !value.trim())) {
+      throw new Error("reference_images must be an array of non-empty strings.");
+    }
+    params.reference_images = params.reference_images.map((value) => value.trim());
+  }
+  if (params.model && params.useDefaultModel === true) throw new Error("model and useDefaultModel cannot both be set.");
+  return params;
+}
+function validateWizardKnown(intent, params, config) {
+  const supportedModels = supportedModelsForIntent(intent);
+  if (params.model && !supportedModels.includes(params.model)) {
+    throw new Error(`Model ${params.model} is not supported for ${intent}. Choose one of: ${supportedModels.join(", ")}.`);
+  }
+  const ratios = intent === "image_gen" ? IMAGE_ASPECT_RATIOS : ASPECT_RATIOS;
+  if (params.aspect_ratio && !ratios.includes(params.aspect_ratio)) {
+    throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported for ${intent}. Choose one of: ${ratios.join(", ")}.`);
+  }
+  if ((intent === "image_gen" || intent === "image_edit") && params.n !== void 0 && ![1, 2, 4].includes(params.n)) {
+    throw new Error("Image count n must be 1, 2, or 4.");
+  }
+  if (intent === "video_gen") {
+    const effectiveModel = params.model ?? defaultModelForIntent(intent, config);
+    const durations = effectiveModel === "seedance_2_0" ? [5, 8, 10, 15] : [3, 5, 8];
+    if (params.duration !== void 0 && !durations.includes(params.duration)) {
+      throw new Error(`Duration ${params.duration} is not supported by ${effectiveModel}. Choose one of: ${durations.join(", ")}.`);
+    }
+    if (params.resolution && effectiveModel !== "seedance_2_0") {
+      throw new Error("resolution is only supported when the effective video model is seedance_2_0.");
+    }
+    if (params.resolution && !SEEDANCE_RESOLUTIONS.includes(params.resolution)) {
+      throw new Error(`Resolution ${params.resolution} is not supported. Choose one of: ${SEEDANCE_RESOLUTIONS.join(", ")}.`);
+    }
+  }
+}
 function imageBlocks(images, label, model, taskId) {
   const blocks = [];
   for (const image of images) {
@@ -491,31 +756,61 @@ function imageOutputSchema() {
     }
   };
 }
-async function prepareInput(config, api, input, signal) {
-  const trimmed = String(input).trim();
+async function prepareInput(config, api, input, exec, attachments) {
+  const trimmed = String(input ?? "dsh-attachment:latest").trim();
+  if (trimmed.startsWith("dsh-attachment:")) {
+    if (!exec.agent) throw new Error("Chat attachment input requires a session-scoped tool call.");
+    if (!attachments?.readImage) throw new Error("DSH attachment storage is unavailable.");
+    const selector = trimmed.slice("dsh-attachment:".length).trim() || "latest";
+    const ref = resolveSessionImageRef(exec, selector);
+    if (!ref) {
+      const count = sessionUserImageRefs(exec).length;
+      throw new Error(selector === "latest" ? "No user-uploaded image was found in the current conversation." : `Image selector ${selector} did not match the current conversation's ${count} user-uploaded image(s). Use latest, first, last, a 1-based number, index:N, or a current-conversation attachment id.`);
+    }
+    const stored = await attachments.readImage(ref, exec.signal);
+    if (!stored?.data) throw new Error("DSH attachment storage returned no image bytes.");
+    if (stored.data.byteLength > config.maxInputImageBytes) throw new Error(`Image input exceeds the ${config.maxInputImageBytes} byte limit.`);
+    const mediaType = stored.ref?.mediaType ?? ref.mediaType;
+    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mediaType)) {
+      throw new Error(`Unsupported chat attachment image type: ${mediaType ?? "unknown"}`);
+    }
+    const dataUrl = `data:${mediaType};base64,${Buffer.from(stored.data).toString("base64")}`;
+    return api.uploadImage(dataUrl, exec.signal);
+  }
   if (!config.allowLocalImageInput && !/^https:\/\//i.test(trimmed)) {
     throw new Error("Local image input is disabled by plugin configuration.");
   }
   const resolved = await resolveImageInput(trimmed, config.maxInputImageBytes);
   if (resolved.source === "remote") return resolved.value;
-  return api.uploadImage(resolved.value, signal);
+  return api.uploadImage(resolved.value, exec.signal);
 }
 function apply(ctx, config) {
   const api = new TokensApiClient(ctx, config);
+  registerDownloadRoute(ctx);
   registerVideoRoute(ctx, config);
   const attachments = ctx.get("attachments");
   const register = (spec) => ctx.tools.register(defineTool(spec));
   ctx.systemPrompt.section({
     name: "media-gen:wizard",
     order: 200,
-    text: "Before image generation, image editing, or video generation, call media_wizard and complete its ordered confirmation flow. The wizard must confirm the prompt, model strategy, output parameters, and final summary. If the user chooses the plugin default model, do not pass model to the generation tool; only pass model after an explicit model choice."
+    text: `Before calling media_wizard, first infer the user's media intent and extract every relevant parameter already supplied by the user or current conversation into known. media_wizard is a missing-parameter completer, not a fixed questionnaire: do not ask the user to repeat information already present.
+
+Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". For image editing, when the current or immediately preceding user request contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the user's requested change as prompt. When the user refers to an ordered image, use a 1-based selector such as dsh-attachment:1 or dsh-attachment:2; first, last, and index:N are also supported. Use a full current-conversation attachment id when it is available. If multiple images exist and the target or role is ambiguous, leave the image field absent so the wizard can ask instead of guessing. Extract explicit model, aspect ratio, image count, duration, resolution, input-image roles, and prompt-enhancement preference when stated. Leave genuinely unspecified or ambiguous values absent so the wizard can ask only for those values. Never invent a local path or URL for a chat attachment.
+
+Known-field contract: prompt is the user's requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when the user explicitly chose enhancement behavior; model is present only for an explicit supported model choice; useDefaultModel is true only when the user explicitly chose the plugin default; aspect_ratio, n, duration, resolution, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived. Set skipFinalConfirmation only when the user explicitly asks to proceed without further confirmation; never infer it merely because the request seems complete.
+
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.`
   });
   register({
     name: "media_wizard",
-    description: "Guided media generation wizard. Run before media_generate_image, media_edit_image, or media_generate_video.",
+    description: "Context-aware media task wizard. Infer intent and pass all user-supplied parameters in known; it asks only for missing values before media generation or editing.",
     parameters: {
       intent: { type: "string", enum: ["image_gen", "image_edit", "video_gen"], required: true },
-      known: { type: "object", additionalProperties: true }
+      known: {
+        type: "object",
+        additionalProperties: true,
+        description: "Parameters already supplied or unambiguously derived from the user request. Supported fields include prompt, promptSource, enhanced, model, useDefaultModel, skipFinalConfirmation, image, aspect_ratio, n, duration, resolution, image_url, start_image, end_image, and reference_images. Do not invent missing values."
+      }
     },
     output: {
       schema: {
@@ -547,49 +842,41 @@ ${JSON.stringify(value.params, null, 2)}`
     },
     async execute(args, exec) {
       const intent = args.intent;
-      const params = { ...args.known ?? {} };
-      delete params.modelExplicit;
+      const params = normalizeWizardKnown(intent, args.known, exec);
+      validateWizardKnown(intent, params, config);
+      const promptProvidedBeforeWizard = Boolean(params.prompt);
+      if (promptProvidedBeforeWizard && !params.promptSource) params.promptSource = "user";
       let needsImage = false;
       let promptConfirmed = false;
       let modelChoiceConfirmed = false;
       let modelExplicit = false;
       let finalConfirmed = false;
-      const result = () => ({
-        intent,
-        confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed,
-        promptConfirmed,
-        modelChoiceConfirmed,
-        modelExplicit,
-        finalConfirmed,
-        needsImage,
-        params
-      });
+      const result = () => ({ intent, confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed, promptConfirmed, modelChoiceConfirmed, modelExplicit, finalConfirmed, needsImage, params });
       try {
         if (intent === "image_edit" && !params.image) {
-          const answers = await ask(ctx, exec, [{
-            id: "image",
-            header: "\u53C2\u8003\u56FE",
-            question: "\u8BF7\u9009\u62E9\u5DF2\u9644\u52A0\u7684\u56FE\u7247\uFF0C\u6216\u8F93\u5165 HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84"
-          }]);
-          params.image = selected(answers.image);
-          if (!params.image) {
-            needsImage = true;
-            return result();
+          const imageCount = sessionUserImageRefs(exec).length;
+          if (imageCount === 1) params.image = "dsh-attachment:latest";
+          else {
+            const answers = await ask(ctx, exec, [{
+              id: "image",
+              header: "\u53C2\u8003\u56FE",
+              question: imageCount > 1 ? `\u5F53\u524D\u5BF9\u8BDD\u6709 ${imageCount} \u5F20\u7528\u6237\u4E0A\u4F20\u56FE\u7247\u3002\u8BF7\u8F93\u5165 dsh-attachment:1 \u81F3 dsh-attachment:${imageCount}\uFF0C\u6216\u8F93\u5165 HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84` : "\u5F53\u524D\u5BF9\u8BDD\u4E2D\u6CA1\u6709\u7528\u6237\u4E0A\u4F20\u7684\u56FE\u7247\u3002\u8BF7\u8F93\u5165 HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84"
+            }]);
+            params.image = selected(answers.image);
+            if (!params.image) {
+              needsImage = true;
+              return result();
+            }
           }
         }
         if (intent === "video_gen") {
           const hasInput = params.image_url || params.start_image || params.end_image || Array.isArray(params.reference_images) && params.reference_images.length;
-          if (!hasInput) {
-            const answers = await ask(ctx, exec, [{
-              id: "video_input",
-              header: "\u89C6\u9891\u7C7B\u578B",
-              question: "\u9009\u62E9\u89C6\u9891\u751F\u6210\u65B9\u5F0F",
-              options: [{ label: "\u7EAF\u6587\u751F\u89C6\u9891 (Recommended)" }, { label: "\u4F7F\u7528\u9996\u5E27\u56FE\u7247" }, { label: "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247" }]
-            }]);
+          if (!hasInput && !params.prompt) {
+            const answers = await ask(ctx, exec, [{ id: "video_input", header: "\u89C6\u9891\u7C7B\u578B", question: "\u9009\u62E9\u89C6\u9891\u751F\u6210\u65B9\u5F0F", options: [{ label: "\u7EAF\u6587\u751F\u89C6\u9891 (Recommended)" }, { label: "\u4F7F\u7528\u9996\u5E27\u56FE\u7247" }, { label: "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247" }] }]);
             const choice = stripRecommended(selected(answers.video_input));
             if (!choice) return result();
             if (choice === "\u4F7F\u7528\u9996\u5E27\u56FE\u7247") {
-              const imageAnswers = await ask(ctx, exec, [{ id: "start_image", header: "\u9996\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5DF2\u9644\u52A0\u7684\u9996\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" }]);
+              const imageAnswers = await ask(ctx, exec, [{ id: "start_image", header: "\u9996\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5DF2\u9644\u52A0\u7684\u9996\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" }]);
               params.start_image = selected(imageAnswers.start_image);
               if (!params.start_image) {
                 needsImage = true;
@@ -598,8 +885,8 @@ ${JSON.stringify(value.params, null, 2)}`
             }
             if (choice === "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247") {
               const imageAnswers = await ask(ctx, exec, [
-                { id: "start_image", header: "\u9996\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5DF2\u9644\u52A0\u7684\u9996\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" },
-                { id: "end_image", header: "\u5C3E\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5DF2\u9644\u52A0\u7684\u5C3E\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" }
+                { id: "start_image", header: "\u9996\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u9996\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" },
+                { id: "end_image", header: "\u5C3E\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5C3E\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" }
               ]);
               params.start_image = selected(imageAnswers.start_image);
               params.end_image = selected(imageAnswers.end_image);
@@ -611,19 +898,22 @@ ${JSON.stringify(value.params, null, 2)}`
           }
         }
         if (!params.prompt) {
-          const answers = await ask(ctx, exec, [{
-            id: "prompt",
-            header: "\u539F\u59CB Prompt",
-            question: intent === "image_edit" ? "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u600E\u4E48\u4FEE\u6539\u56FE\u7247" : intent === "video_gen" ? "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u751F\u6210\u7684\u89C6\u9891" : "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u751F\u6210\u7684\u56FE\u7247"
-          }]);
+          const answers = await ask(ctx, exec, [{ id: "prompt", header: "\u539F\u59CB Prompt", question: intent === "image_edit" ? "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u600E\u4E48\u4FEE\u6539\u56FE\u7247" : intent === "video_gen" ? "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u751F\u6210\u7684\u89C6\u9891" : "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u751F\u6210\u7684\u56FE\u7247" }]);
           params.prompt = selected(answers.prompt);
           if (!params.prompt) return result();
+          params.prompt = String(params.prompt).trim();
+          params.promptSource = "wizard";
+        }
+        if (params.enhanced === true && !config.enhanceEnabled) throw new Error("Prompt enhancement was requested, but enhancement is disabled by plugin configuration.");
+        if (params.enhanced === true && !params.originalPrompt) {
+          const original = params.prompt;
+          const enhanced = await api.enhance(intent, original, exec.signal);
+          params.originalPrompt = original;
+          params.prompt = enhanced;
+          params.enhanced = enhanced !== original;
         }
         if (params.enhanced === void 0) {
-          const enhanceOptions = config.enhanceEnabled ? [
-            { label: "\u589E\u5F3A Prompt (Recommended)", description: "\u4F18\u5316\u89C6\u89C9\u3001\u955C\u5934\u548C\u8D28\u91CF\u7EC6\u8282" },
-            { label: "\u4FDD\u6301\u539F\u59CB Prompt", description: "\u4E0D\u4FEE\u6539\u5185\u5BB9\u63CF\u8FF0" }
-          ] : [{ label: "\u4FDD\u6301\u539F\u59CB Prompt (Recommended)", description: "\u5F53\u524D\u672A\u542F\u7528\u63D0\u793A\u8BCD\u589E\u5F3A\u670D\u52A1" }];
+          const enhanceOptions = config.enhanceEnabled ? [{ label: "\u589E\u5F3A Prompt (Recommended)", description: "\u4F18\u5316\u89C6\u89C9\u3001\u955C\u5934\u548C\u8D28\u91CF\u7EC6\u8282" }, { label: "\u4FDD\u6301\u539F\u59CB Prompt", description: "\u4E0D\u4FEE\u6539\u5185\u5BB9\u63CF\u8FF0" }] : [{ label: "\u4FDD\u6301\u539F\u59CB Prompt (Recommended)", description: "\u5F53\u524D\u672A\u542F\u7528\u63D0\u793A\u8BCD\u589E\u5F3A\u670D\u52A1" }];
           const answers = await ask(ctx, exec, [{ id: "enhance", header: "Prompt \u589E\u5F3A", question: "\u662F\u5426\u589E\u5F3A Prompt\uFF1F", options: enhanceOptions }]);
           const choice = stripRecommended(selected(answers.enhance));
           if (!choice) return result();
@@ -633,71 +923,53 @@ ${JSON.stringify(value.params, null, 2)}`
             params.originalPrompt = original;
             params.prompt = enhanced;
             params.enhanced = enhanced !== original;
+          } else params.enhanced = false;
+        }
+        const promptWasEnhanced = Boolean(params.originalPrompt && params.prompt !== params.originalPrompt);
+        if (promptWasEnhanced) {
+          const promptAnswers = await ask(ctx, exec, [{ id: "prompt_confirm", header: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt", question: "Prompt \u5DF2\u88AB\u589E\u5F3A\uFF0C\u662F\u5426\u4F7F\u7528\u589E\u5F3A\u540E\u7684\u5185\u5BB9\uFF1F", detail: `\u539F\u59CB Prompt:
+${params.originalPrompt}
+
+\u589E\u5F3A\u540E Prompt:
+${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Recommended)" }, { label: "\u53D6\u6D88" }] }]);
+          promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === "\u786E\u8BA4\u589E\u5F3A\u540E Prompt";
+        } else promptConfirmed = Boolean(params.prompt);
+        if (!promptConfirmed) return result();
+        const selectableModels = supportedModelsForIntent(intent);
+        const defaultModel = defaultModelForIntent(intent, config);
+        if (params.model) {
+          modelChoiceConfirmed = true;
+          modelExplicit = true;
+          delete params.useDefaultModel;
+        } else if (params.useDefaultModel === true) {
+          modelChoiceConfirmed = true;
+          modelExplicit = false;
+          delete params.model;
+        } else {
+          const defaultModelLabel = `${defaultModel}\uFF08\u63D2\u4EF6\u9ED8\u8BA4\uFF0C\u63A8\u8350\uFF09`;
+          const modelOptions = [{ label: defaultModelLabel, description: "\u4F7F\u7528\u63D2\u4EF6\u5F53\u524D\u914D\u7F6E\u7684\u9ED8\u8BA4\u6A21\u578B" }, ...selectableModels.filter((model) => model !== defaultModel).map((model) => ({ label: model }))];
+          const modelAnswers = await ask(ctx, exec, [{ id: "model", header: "\u6A21\u578B", question: "\u9009\u62E9\u6A21\u578B", options: modelOptions }]);
+          const rawModelChoice = selected(modelAnswers.model);
+          if (!rawModelChoice) return result();
+          const usesPluginDefault = rawModelChoice === defaultModelLabel;
+          modelChoiceConfirmed = true;
+          if (usesPluginDefault) {
+            params.useDefaultModel = true;
+            delete params.model;
+            modelExplicit = false;
           } else {
-            params.enhanced = false;
+            params.model = stripRecommended(rawModelChoice);
+            delete params.useDefaultModel;
+            modelExplicit = true;
           }
         }
-        const promptAnswers = await ask(ctx, exec, [{
-          id: "prompt_confirm",
-          header: "\u786E\u8BA4 Prompt",
-          question: "\u662F\u5426\u4F7F\u7528\u8FD9\u4E2A\u6700\u7EC8 Prompt\uFF1F",
-          detail: String(params.prompt),
-          options: [{ label: "\u786E\u8BA4 Prompt (Recommended)" }, { label: "\u53D6\u6D88" }]
-        }]);
-        promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === "\u786E\u8BA4 Prompt";
-        if (!promptConfirmed) return result();
-        const selectableModels = intent === "video_gen" ? VIDEO_MODELS : intent === "image_edit" ? IMAGE_EDIT_MODELS : IMAGE_MODELS;
-        const defaultModel = intent === "video_gen" ? config.defaultVideoModel : intent === "image_edit" ? config.defaultEditModel : config.defaultImageModel;
-        const defaultModelLabel = `${defaultModel}\uFF08\u63D2\u4EF6\u9ED8\u8BA4\uFF0C\u63A8\u8350\uFF09`;
-        const modelOptions = [
-          { label: defaultModelLabel, description: "\u4F7F\u7528\u63D2\u4EF6\u5F53\u524D\u914D\u7F6E\u7684\u9ED8\u8BA4\u6A21\u578B" },
-          ...selectableModels.filter((model) => model !== defaultModel).map((model) => ({ label: model }))
-        ];
-        const modelAnswers = await ask(ctx, exec, [{ id: "model", header: "\u6A21\u578B", question: "\u9009\u62E9\u6A21\u578B", options: modelOptions }]);
-        const rawModelChoice = selected(modelAnswers.model);
-        if (!rawModelChoice) return result();
-        const usesPluginDefault = rawModelChoice === defaultModelLabel;
-        const modelChoice = usesPluginDefault ? defaultModel : stripRecommended(rawModelChoice);
-        modelChoiceConfirmed = true;
-        if (usesPluginDefault) {
-          delete params.model;
-          modelExplicit = false;
-        } else {
-          params.model = modelChoice;
-          modelExplicit = true;
-        }
-        const effectiveVideoModel = intent === "video_gen" ? params.model ?? config.defaultVideoModel : void 0;
+        const effectiveVideoModel = intent === "video_gen" ? params.model ?? defaultModel : void 0;
         const outputQuestions = [];
-        if (intent === "image_gen" && !params.aspect_ratio) outputQuestions.push({
-          id: "aspect_ratio",
-          header: "\u753B\u9762\u6BD4\u4F8B",
-          question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B",
-          options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === "1:1" ? `${ratio} (Recommended)` : ratio }))
-        });
-        if ((intent === "image_edit" || intent === "video_gen") && !params.aspect_ratio) outputQuestions.push({
-          id: "aspect_ratio",
-          header: "\u753B\u9762\u6BD4\u4F8B",
-          question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B",
-          options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio }))
-        });
-        if (intent === "video_gen" && !params.duration) outputQuestions.push({
-          id: "duration",
-          header: "\u65F6\u957F",
-          question: "\u9009\u62E9\u89C6\u9891\u65F6\u957F",
-          options: effectiveVideoModel === "seedance_2_0" ? [{ label: "5 \u79D2 (Recommended)" }, { label: "8 \u79D2" }, { label: "10 \u79D2" }, { label: "15 \u79D2" }] : [{ label: "5 \u79D2 (Recommended)" }, { label: "3 \u79D2" }, { label: "8 \u79D2" }]
-        });
-        if (intent === "video_gen" && effectiveVideoModel === "seedance_2_0" && !params.resolution) outputQuestions.push({
-          id: "resolution",
-          header: "\u5206\u8FA8\u7387",
-          question: "\u9009\u62E9\u89C6\u9891\u5206\u8FA8\u7387",
-          options: SEEDANCE_RESOLUTIONS.map((resolution) => ({ label: resolution === "720p" ? `${resolution} (Recommended)` : resolution }))
-        });
-        if ((intent === "image_gen" || intent === "image_edit") && !params.n) outputQuestions.push({
-          id: "n",
-          header: "\u6570\u91CF",
-          question: "\u751F\u6210\u51E0\u5F20\uFF1F",
-          options: [{ label: "1 \u5F20 (Recommended)" }, { label: "2 \u5F20" }, { label: "4 \u5F20" }]
-        });
+        if (intent === "image_gen" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === "1:1" ? `${ratio} (Recommended)` : ratio })) });
+        if ((intent === "image_edit" || intent === "video_gen") && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio })) });
+        if (intent === "video_gen" && !params.duration) outputQuestions.push({ id: "duration", header: "\u65F6\u957F", question: "\u9009\u62E9\u89C6\u9891\u65F6\u957F", options: effectiveVideoModel === "seedance_2_0" ? [{ label: "5 \u79D2 (Recommended)" }, { label: "8 \u79D2" }, { label: "10 \u79D2" }, { label: "15 \u79D2" }] : [{ label: "5 \u79D2 (Recommended)" }, { label: "3 \u79D2" }, { label: "8 \u79D2" }] });
+        if (intent === "video_gen" && effectiveVideoModel === "seedance_2_0" && !params.resolution) outputQuestions.push({ id: "resolution", header: "\u5206\u8FA8\u7387", question: "\u9009\u62E9\u89C6\u9891\u5206\u8FA8\u7387", options: SEEDANCE_RESOLUTIONS.map((resolution) => ({ label: resolution === "720p" ? `${resolution} (Recommended)` : resolution })) });
+        if ((intent === "image_gen" || intent === "image_edit") && !params.n) outputQuestions.push({ id: "n", header: "\u6570\u91CF", question: "\u751F\u6210\u51E0\u5F20\uFF1F", options: [{ label: "1 \u5F20 (Recommended)" }, { label: "2 \u5F20" }, { label: "4 \u5F20" }] });
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions);
           if (answers.aspect_ratio) params.aspect_ratio = stripRecommended(selected(answers.aspect_ratio));
@@ -705,28 +977,32 @@ ${JSON.stringify(value.params, null, 2)}`
           if (answers.resolution) params.resolution = stripRecommended(selected(answers.resolution));
           if (answers.n) params.n = numberLabel(selected(answers.n));
         }
+        validateWizardKnown(intent, params, config);
         const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === "video_gen" ? Boolean(params.duration) && (effectiveVideoModel !== "seedance_2_0" || Boolean(params.resolution)) : Boolean(params.n));
         if (!requiredParametersPresent) return result();
+        const taskLabel = intent === "image_edit" ? "\u56FE\u7247\u7F16\u8F91" : intent === "video_gen" ? "\u89C6\u9891\u751F\u6210" : "\u56FE\u7247\u751F\u6210";
+        const inputLines = intent === "image_edit" ? [`- \u53C2\u8003\u56FE: ${describeImageInput(params.image)}`] : intent === "video_gen" ? [
+          ...params.start_image || params.image_url ? [`- \u9996\u5E27\u56FE\u7247: ${describeImageInput(params.start_image ?? params.image_url)}`] : [],
+          ...params.end_image ? [`- \u5C3E\u5E27\u56FE\u7247: ${describeImageInput(params.end_image)}`] : [],
+          ...Array.isArray(params.reference_images) && params.reference_images.length ? [`- \u53C2\u8003\u56FE\u7247: ${params.reference_images.map(describeImageInput).join(", ")}`] : []
+        ] : [];
         const parameterLines = [
+          `- \u4EFB\u52A1: ${taskLabel}`,
+          ...inputLines,
+          `- \u5185\u5BB9: ${params.prompt}`,
+          `- Prompt \u6765\u6E90: ${params.promptSource ?? (promptProvidedBeforeWizard ? "user" : "wizard")}`,
+          `- Prompt \u589E\u5F3A: ${promptWasEnhanced ? "\u5DF2\u589E\u5F3A" : "\u672A\u589E\u5F3A"}`,
+          `- \u6A21\u578B: ${params.model ?? `${defaultModel}\uFF08\u63D2\u4EF6\u9ED8\u8BA4\uFF09`}`,
           `- \u753B\u9762\u6BD4\u4F8B: ${params.aspect_ratio}`,
           ...params.duration ? [`- \u65F6\u957F: ${params.duration} \u79D2`] : [],
           ...intent === "video_gen" ? [`- \u5206\u8FA8\u7387: ${params.resolution ?? "\u6A21\u578B\u5DE5\u4F5C\u6D41\u9ED8\u8BA4\u503C"}`] : [],
-          ...params.n ? [`- \u6570\u91CF: ${params.n} \u5F20`] : [],
-          ...needsImage ? ["- \u56FE\u7247\u8F93\u5165: \u9700\u8981\u63D0\u4F9B"] : []
+          ...params.n ? [`- \u6570\u91CF: ${params.n} \u5F20`] : []
         ];
-        const finalLines = [
-          `- \u5185\u5BB9: ${params.prompt}`,
-          `- \u6A21\u578B: ${params.model ?? `${defaultModel}\uFF08\u63D2\u4EF6\u9ED8\u8BA4\uFF09`}`,
-          ...parameterLines
-        ];
-        const finalAnswers = await ask(ctx, exec, [{
-          id: "final_confirm",
-          header: "\u6700\u7EC8\u786E\u8BA4",
-          question: "\u6309\u4EE5\u4E0B\u5B8C\u6574\u914D\u7F6E\u521B\u5EFA\u4EFB\u52A1\u5417\uFF1F",
-          detail: finalLines.join("\n"),
-          options: [{ label: "\u786E\u8BA4\u751F\u6210 (Recommended)" }, { label: "\u53D6\u6D88" }]
-        }]);
-        finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === "\u786E\u8BA4\u751F\u6210";
+        if (params.skipFinalConfirmation === true) finalConfirmed = true;
+        else {
+          const finalAnswers = await ask(ctx, exec, [{ id: "final_confirm", header: "\u6700\u7EC8\u786E\u8BA4", question: "\u6309\u4EE5\u4E0B\u5B8C\u6574\u914D\u7F6E\u521B\u5EFA\u4EFB\u52A1\u5417\uFF1F", detail: parameterLines.join("\n"), options: [{ label: "\u786E\u8BA4\u751F\u6210 (Recommended)" }, { label: "\u53D6\u6D88" }] }]);
+          finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === "\u786E\u8BA4\u751F\u6210";
+        }
         return result();
       } catch (error) {
         if (error?.code === "ASK_CANCELLED") return result();
@@ -753,15 +1029,16 @@ ${JSON.stringify(value.params, null, 2)}`
       const data = await api.poll(taskId, exec.signal);
       const timedOut = data.timedOut === true;
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal);
+      if (!timedOut && images.length > 0) exec.concludeTurn();
       return { taskId, model, images, ...timedOut ? { timedOut: true } : {} };
     }
   });
   register({
     name: "media_edit_image",
-    description: "Edit an image with TokensAPI. HTTPS URLs and local/data images are supported; local images use TokensAPI first-party presigned upload without third-party hosting.",
+    description: "Edit an image with TokensAPI. Omit image to use the latest user-uploaded image in the current conversation; HTTPS URLs and local/data images are also supported.",
     parameters: {
       prompt: { type: "string", required: true },
-      image: { type: "string", required: true },
+      image: { type: "string", description: "Optional image source: dsh-attachment:latest, first, last, a 1-based selector such as dsh-attachment:2, index:N, a current-conversation attachment id, HTTPS URL, local path, or data URL. Defaults to the latest user-uploaded conversation image." },
       model: { type: "string", enum: [...IMAGE_EDIT_MODELS] },
       aspect_ratio: { type: "string", enum: [...ASPECT_RATIOS] },
       n: { type: "integer" }
@@ -775,7 +1052,7 @@ ${JSON.stringify(value.params, null, 2)}`
       if (!IMAGE_EDIT_MODELS.includes(model)) {
         throw new Error(`Model ${model} does not support image editing. Choose image2 or qwen_image.`);
       }
-      const image = await prepareInput(config, api, args.image, exec.signal);
+      const image = await prepareInput(config, api, args.image, exec, attachments);
       const body = {
         model,
         prompt: args.prompt,
@@ -787,6 +1064,7 @@ ${JSON.stringify(value.params, null, 2)}`
       const data = await api.poll(taskId, exec.signal);
       const timedOut = data.timedOut === true;
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal);
+      if (!timedOut && images.length > 0) exec.concludeTurn();
       return { taskId, model, images, ...timedOut ? { timedOut: true } : {} };
     }
   });
@@ -821,17 +1099,17 @@ ${JSON.stringify(value.params, null, 2)}`
   };
   register({
     name: "media_generate_video",
-    description: "Generate a short TokensAPI video. Supports text and first/last frame images. Local images use TokensAPI first-party presigned upload.",
+    description: "Generate a short TokensAPI video. Supports text and first/last frame images; image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.",
     parameters: {
       prompt: { type: "string", required: true },
       model: { type: "string", enum: [...VIDEO_MODELS] },
       duration: { type: "integer", enum: [...DURATIONS] },
       resolution: { type: "string", enum: [...SEEDANCE_RESOLUTIONS] },
       aspect_ratio: { type: "string", enum: [...ASPECT_RATIOS] },
-      image_url: { type: "string" },
-      reference_images: { type: "array", items: { type: "string" } },
-      start_image: { type: "string" },
-      end_image: { type: "string" }
+      image_url: { type: "string", description: "Legacy first-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." },
+      reference_images: { type: "array", items: { type: "string" }, description: "Reference image inputs support dsh-attachment selectors, although the current production video contract may reject generic references." },
+      start_image: { type: "string", description: "First-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." },
+      end_image: { type: "string", description: "Last-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." }
     },
     output: { schema: videoSchema, render: renderVideo },
     async execute(args, exec) {
@@ -839,11 +1117,12 @@ ${JSON.stringify(value.params, null, 2)}`
       const model = args.model ?? config.defaultVideoModel;
       if (args.resolution && model !== "seedance_2_0") throw new Error("resolution is configurable only for seedance_2_0; ltx_2_3 uses its workflow default.");
       if (Array.isArray(args.reference_images) && args.reference_images.length > 0) {
+        await Promise.all(args.reference_images.map((input) => prepareInput(config, api, input, exec, attachments)));
         throw new Error("The current TokensAPI production video contract supports first/last frame_images, not generic reference_images.");
       }
       const firstInput = args.start_image ?? args.image_url;
-      const startImage = typeof firstInput === "string" ? await prepareInput(config, api, firstInput, exec.signal) : void 0;
-      const endImage = typeof args.end_image === "string" ? await prepareInput(config, api, args.end_image, exec.signal) : void 0;
+      const startImage = typeof firstInput === "string" ? await prepareInput(config, api, firstInput, exec, attachments) : void 0;
+      const endImage = typeof args.end_image === "string" ? await prepareInput(config, api, args.end_image, exec, attachments) : void 0;
       const frameImages = [
         ...startImage ? [{ type: "image_url", frame_type: "first_frame", image_url: { url: startImage } }] : [],
         ...endImage ? [{ type: "image_url", frame_type: "last_frame", image_url: { url: endImage } }] : []
@@ -863,6 +1142,7 @@ ${JSON.stringify(value.params, null, 2)}`
       const url = api.urls(data)[0];
       const saved = await saveVideo(url, taskId, config, exec.signal);
       const media = data.media && typeof data.media === "object" ? data.media : {};
+      if (url) exec.concludeTurn();
       return {
         taskId,
         model,
@@ -896,7 +1176,7 @@ Video models: ${value.videos.join(", ")}` }]
   });
   register({
     name: "media_task_status",
-    description: "Check and recover a TokensAPI media task. Completed images are saved as DSH attachments; completed videos are saved locally.",
+    description: "Check and recover a TokensAPI media task. Completed images are saved as DSH attachments; completed videos remain available by remote URL and explicit download.",
     parameters: {
       task_id: { type: "string", required: true },
       kind: { type: "string", enum: ["auto", "images", "videos"] }
@@ -938,9 +1218,11 @@ Video models: ${value.videos.join(", ")}` }]
       const detectedKind = args.kind && args.kind !== "auto" ? args.kind : data.media && typeof data.media === "object" ? "videos" : urls.some((url) => /\.(?:mp4|webm)(?:\?|$)/i.test(url)) ? "videos" : "images";
       if (detectedKind === "videos") {
         const saved = await saveVideo(urls[0], args.task_id, config, exec.signal);
+        if (urls[0]) exec.concludeTurn();
         return { taskId: args.task_id, status, progress, kind: "videos", ...saved };
       }
       const images = await saveImages(urls, args.task_id, attachments, exec.signal);
+      if (images.length > 0) exec.concludeTurn();
       return { taskId: args.task_id, status, progress, kind: "images", images };
     }
   });

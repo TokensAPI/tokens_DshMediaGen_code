@@ -1,10 +1,12 @@
-# @tokens/dsh-media-gen
+# @tokensapi/dsh-media-gen
 
-面向 DeepSeek Harness 的 TokensAPI 图片与视频生成插件。
+面向 DeepSeek Harness 的上下文感知 TokensAPI 图片与视频生成插件。
+
+本包发布在 `@tokensapi` npm scope 下，基于上游 [`@tokens/dsh-media-gen`](https://github.com/TokensAPI/tokens_DshMediaGen_code) 项目继续开发。
 
 ## 兼容性
 
-`0.2.x` 系列锁定并验证：
+`0.3.x` 系列锁定并验证：
 
 - DeepSeek Harness / DSH `0.1.0-rc.8`
 - Node.js `^22.19.0 || >=24.0.0`
@@ -27,7 +29,7 @@
 
 TokensAPI 生产任务接口要求参考图片是公开可访问的 HTTPS URL。插件不会把本地图片上传到 `uguu.se`、`tmpfiles.org` 或其他第三方临时图床。
 
-本地图片使用 TokensAPI 第一方预签名直传：插件向 `/api/aigc/presign` 申请 `upload_url` 和 `access_url`，再用原始字节 `PUT` 到对象存储，最后将 `access_url` 提交给模型。整个流程不使用第三方临时图床。
+本地图片和当前对话中的 DSH 图片附件使用第一方存储上传，不经过第三方临时图床。默认模式向 TokensAPI `/api/aigc/presign` 申请 `upload_url` 和 `access_url`，再用原始字节 `PUT`；也可以配置 `storageBackend: r2`，通过 S3 Signature V4 将图片直接上传到自己的 Cloudflare R2/S3 兼容存储，并把 CDN URL 提交给模型。聊天附件始终通过 DSH 官方 `attachments.readImage()` 接口读取和校验，不暴露或猜测用户原始文件路径。
 
 ## 分发与安装
 
@@ -67,7 +69,7 @@ pnpm add ~/Downloads/tokens-dsh-media-gen-<版本号>.tgz
 安装后，包通常位于：
 
 ```text
-~/.dsh/profiles/node_modules/@tokens/dsh-media-gen
+~/.dsh/profiles/node_modules/@tokensapi/dsh-media-gen
 ```
 
 如果目标机器使用其他 DSH profile，应在实际启用的 profile 目录中安装，不能仅凭目录名称推断当前 profile。
@@ -79,7 +81,7 @@ pnpm add ~/Downloads/tokens-dsh-media-gen-<版本号>.tgz
 ```yaml
 - insert:
     - id: media-gen
-      name: '@tokens/dsh-media-gen'
+      name: '@tokensapi/dsh-media-gen'
 ```
 
 如果文件中已经存在同一个 `insert` 列表，可把 `media-gen` 加入现有列表，避免创建冲突或重复的 YAML 结构。插件包本身也包含 `cordis.patch.yml`，支持 DSH bundle 安装机制。
@@ -89,7 +91,7 @@ pnpm add ~/Downloads/tokens-dsh-media-gen-<版本号>.tgz
 ```yaml
 - insert:
     - id: media-gen
-      name: '@tokens/dsh-media-gen'
+      name: '@tokensapi/dsh-media-gen'
       config:
         defaultImageModel: z_image_turbo
         defaultEditModel: qwen_image
@@ -150,7 +152,7 @@ TOKENSAPI_ACCOUNT_ACCESS_TOKEN
 ```yaml
 - insert:
     - id: media-gen
-      name: '@tokens/dsh-media-gen'
+      name: '@tokensapi/dsh-media-gen'
       config:
         uploadAuthMode: account
         accountUserId: "你的数字用户ID"
@@ -161,7 +163,7 @@ TOKENSAPI_ACCOUNT_ACCESS_TOKEN
 ```yaml
 - insert:
     - id: media-gen
-      name: '@tokens/dsh-media-gen'
+      name: '@tokensapi/dsh-media-gen'
       config:
         uploadAuthMode: api_key
 ```
@@ -189,6 +191,14 @@ imageUploadURL: https://tokensapi.ai/api/aigc/presign
 uploadAuthMode: account
 accountAccessTokenEnv: TOKENSAPI_ACCOUNT_ACCESS_TOKEN
 accountUserId: ""
+storageBackend: presign
+r2Endpoint: ""
+r2Region: auto
+r2AccessKeyEnv: R2_ACCESS_KEY_ID
+r2SecretKeyEnv: R2_SECRET_ACCESS_KEY
+r2Bucket: ""
+r2CdnBase: ""
+r2PathPrefix: inputs
 ```
 
 可以在 profile 中覆盖配置：
@@ -196,7 +206,7 @@ accountUserId: ""
 ```yaml
 - insert:
     - id: media-gen
-      name: '@tokens/dsh-media-gen'
+      name: '@tokensapi/dsh-media-gen'
       config:
         outputDir: /your/media/output
         enhanceEnabled: true
@@ -206,11 +216,11 @@ accountUserId: ""
 
 ## 媒体向导
 
-图片生成、图片编辑和视频生成都必须先完成有序向导：确认最终 Prompt、明确选择默认或具体模型、选择输出参数，然后在完整摘要中一次性最终确认。输出参数不再设置重复的独立确认步骤。选择插件默认模型时，生成工具不传 `model`；只有用户明确选择模型时才传入。
+图片生成、图片编辑和视频生成前都要调用上下文感知向导。调用方应先把用户已经提供或可无歧义推断的 Prompt、聊天附件、模型、比例、数量、时长、分辨率和增强偏好放入 `known`；向导只补问缺失参数。未被增强服务改写的用户 Prompt 不重复确认，增强后的 Prompt 会显示前后对照；默认保留一次完整摘要最终确认，只有用户明确要求直接执行时才允许跳过。选择插件默认模型时，生成工具不传 `model`；只有用户明确选择具体模型时才传入。
 
 图片生成只展示 TokensAPI 支持的画面比例，不显示像素分辨率：`1:1`、`16:9`、`9:16`、`4:3`、`3:4`、`3:2`、`2:3`。
 
-视频输出参数根据所选模型动态显示：`ltx_2_3` 支持 3/5/8 秒并使用工作流默认分辨率；`seedance_2_0` 支持 5/8/10/15 秒，并提供 `480p`、`720p`、`1080p` 可点击分辨率选项（默认 `720p`）。
+视频输出参数根据所选模型动态显示：`ltx_2_3` 支持 3/5/8 秒并使用工作流默认分辨率；`seedance_2_0` 支持 5/8/10/15 秒，并提供 `480p`、`720p`、`1080p` 可点击分辨率选项（默认 `720p`）。用户已经给出纯文本视频 Prompt 且没有图片输入时，向导直接推断为纯文生视频，不再额外询问视频类型。最终摘要会列出任务类型、图片输入、Prompt 来源和增强状态、模型与完整输出参数；`skipFinalConfirmation` 只应在用户明确要求直接执行时使用。
 
 任一步取消或缺少确认时，向导不会完成，也不会创建生成任务。
 
@@ -218,7 +228,7 @@ accountUserId: ""
 
 生产任务始终支持公开 HTTPS URL。
 
-配置有效的预签名上传鉴权后，还支持 Base64/Data URL 和 DSH Host 可以读取的本地图片路径。支持 PNG、JPEG、WebP、GIF，最大 30 MB。HTTP 明文 URL 会被拒绝。上传流程在创建生成任务之前完成，鉴权失败不会调用模型或产生生成费用。
+配置有效的预签名或 R2 上传后，还支持 Base64/Data URL、DSH Host 可以读取的本地图片路径，以及当前对话中的用户图片附件。聊天附件选择器包括 `dsh-attachment:latest`、`dsh-attachment:first`、`dsh-attachment:last`、1-based 数字（如 `dsh-attachment:2`）、`dsh-attachment:index:N` 和当前会话附件 ID（`sha256:` 前缀可省略）。图片编辑省略 `image` 时默认使用最近一张用户图片；当前对话只有一张用户图片时向导可自动选择，有多张且角色不明确时必须补问，不能猜测最近一张。附件通过 `attachments.readImage` 在当前会话范围内读取。视频的 `image_url`、`start_image`、`end_image` 和 `reference_images` 也支持这些选择器，但当前生产视频契约仍不接受通用 `reference_images`，应优先使用首帧/尾帧字段。支持 PNG、JPEG、WebP、GIF，最大 30 MB。HTTP 明文 URL 会被拒绝。上传流程在创建生成任务之前完成，鉴权失败不会调用模型或产生生成费用。
 
 ## 图片显示
 

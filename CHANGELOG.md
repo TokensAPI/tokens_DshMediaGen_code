@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.1
+
+- Fixed the web client bundle to register `@tokensapi/dsh-media-gen`, matching the published package name and preventing Harness plugin-loader startup failures.
+- Added build-time and test-time checks that reject future package-name and client-module-ID mismatches.
+
+## 0.3.0
+
+- Published under the `@tokensapi` npm scope with clear attribution to the upstream `@tokens/dsh-media-gen` project.
+- Added direct image editing from current DSH conversation attachments through the official attachment store.
+- Added latest, first, last, 1-based, and current-session attachment-id selectors for uploaded images.
+- Added context-aware intent and parameter extraction guidance and a missing-parameter-only media wizard.
+- Added known-parameter normalization and model-aware validation for models, aspect ratios, counts, durations, resolutions, and input-image roles.
+- Removed redundant confirmation for unchanged user prompts while retaining confirmation for enhanced prompts.
+- Added explicit final-confirmation skipping only when requested by the user.
+- Added R2/S3 reference-image upload support alongside TokensAPI presigned upload.
+- Added focused context-wizard and conversation-attachment regression tests.
+
 ## 0.2.2
 
 - Enabled prompt enhancement by default.

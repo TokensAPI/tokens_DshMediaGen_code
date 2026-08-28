@@ -37,4 +37,12 @@ export interface MediaConfig {
   uploadAuthMode: 'account' | 'api_key'
   accountAccessTokenEnv: string
   accountUserId: string
+  storageBackend: 'presign' | 'r2'
+  r2Endpoint: string
+  r2Region: string
+  r2AccessKeyEnv: string
+  r2SecretKeyEnv: string
+  r2Bucket: string
+  r2CdnBase: string
+  r2PathPrefix: string
 }

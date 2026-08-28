@@ -11,4 +11,9 @@ const source = await readFile('lib/client.js', 'utf8')
 if (!source.includes('window.__ModuleLoader__.load')) {
   throw new Error('lib/client.js does not look like a DSH client bundle.')
 }
+const pkg = JSON.parse(await readFile('package.json', 'utf8'))
+const expectedId = `id: '${pkg.name}'`
+if (!source.includes(expectedId)) {
+  throw new Error(`lib/client.js must register the package name ${pkg.name}.`)
+}
 console.log(`verified lib/client.js (${info.size} bytes)`)

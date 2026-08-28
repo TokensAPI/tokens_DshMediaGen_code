@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import {
   ASPECT_RATIOS,
   DURATIONS,
@@ -42,11 +43,80 @@ export const Config = Schema.object({
   uploadAuthMode: Schema.union(['account', 'api_key']).default('account'),
   accountAccessTokenEnv: Schema.string().role('credential-ref').default('TOKENSAPI_ACCOUNT_ACCESS_TOKEN'),
   accountUserId: Schema.string().default(''),
+  storageBackend: Schema.union(['presign', 'r2']).default('presign'),
+  r2Endpoint: Schema.string().default(''),
+  r2Region: Schema.string().default('auto'),
+  r2AccessKeyEnv: Schema.string().role('credential-ref').default('R2_ACCESS_KEY_ID'),
+  r2SecretKeyEnv: Schema.string().role('credential-ref').default('R2_SECRET_ACCESS_KEY'),
+  r2Bucket: Schema.string().default(''),
+  r2CdnBase: Schema.string().default(''),
+  r2PathPrefix: Schema.string().default('inputs'),
 })
 
 type AnyRecord = Record<string, any>
 
 const VIDEO_ROUTE_PREFIX = '/media-gen/videos'
+const DOWNLOAD_ROUTE = '/media-gen/download'
+
+function safeDownloadName(url: URL, requestedName: string | null): string {
+  const fallback = url.pathname.split('/').pop() || 'media-download'
+  const value = String(requestedName || fallback).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 160)
+  return value || 'media-download'
+}
+
+function registerDownloadRoute(ctx: AnyRecord): void {
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: DOWNLOAD_ROUTE,
+    async handler(req: AnyRecord, res: AnyRecord) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { Allow: 'GET, HEAD' })
+        res.end()
+        return
+      }
+      let source: URL
+      let filename: string
+      try {
+        const requestUrl = new URL(req.url ?? DOWNLOAD_ROUTE, 'http://dsh.local')
+        source = new URL(requestUrl.searchParams.get('url') || '')
+        filename = safeDownloadName(source, requestUrl.searchParams.get('name'))
+      } catch {
+        res.writeHead(400)
+        res.end()
+        return
+      }
+      if (source.protocol !== 'https:' || source.hostname !== 's3.tokensapi.ai') {
+        res.writeHead(403)
+        res.end()
+        return
+      }
+      try {
+        const response = await fetch(source)
+        if (!response.ok || !response.body) {
+          res.writeHead(response.status || 502)
+          res.end()
+          return
+        }
+        const headers: Record<string, string> = {
+          'Content-Type': response.headers.get('content-type') || 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Cache-Control': 'private, max-age=300',
+        }
+        const length = response.headers.get('content-length')
+        if (length) headers['Content-Length'] = length
+        res.writeHead(200, headers)
+        if (req.method === 'HEAD') {
+          res.end()
+          return
+        }
+        Readable.fromWeb(response.body as any).pipe(res as any)
+      } catch {
+        res.writeHead(502)
+        res.end()
+      }
+    },
+  }), 'media-gen: explicit download route')
+}
 
 function parseRange(value: string | undefined, size: number): { start: number; end: number } | null {
   if (!value) return null
@@ -135,6 +205,125 @@ async function ask(ctx: AnyRecord, exec: AnyRecord, questions: AnyRecord[]): Pro
   return Object.fromEntries((response.answers ?? []).map((answer: AnyRecord) => [answer.id, answer]))
 }
 
+function sessionUserImageRefs(exec: AnyRecord): AnyRecord[] {
+  const messages = exec.agent?.session?.deriveMessages?.() ?? []
+  const refs: AnyRecord[] = []
+  for (const message of messages) {
+    if (message?.role !== 'user' || !Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      if (block?.type !== 'image' || !block.attachment || typeof block.attachment !== 'object') continue
+      if (typeof block.attachment.attachmentId !== 'string') continue
+      refs.push(block.attachment)
+    }
+  }
+  return refs
+}
+
+function resolveSessionImageRef(exec: AnyRecord, selector: string): AnyRecord | null {
+  const refs = sessionUserImageRefs(exec)
+  if (refs.length === 0) return null
+  if (!selector || selector === 'latest') return refs.at(-1) ?? null
+  if (selector === 'first') return refs[0] ?? null
+  if (selector === 'last') return refs.at(-1) ?? null
+  const ordinal = /^(?:index:)?(\d+)$/.exec(selector)
+  if (ordinal) {
+    const position = Number(ordinal[1])
+    if (!Number.isSafeInteger(position) || position < 1) return null
+    return refs[position - 1] ?? null
+  }
+  const attachmentId = selector.startsWith('sha256:') ? selector : `sha256:${selector}`
+  for (let index = refs.length - 1; index >= 0; index -= 1) {
+    if (refs[index]?.attachmentId === attachmentId) return refs[index] ?? null
+  }
+  return null
+}
+
+function describeSessionImageSelector(selector: string): string {
+  if (!selector || selector === 'latest' || selector === 'last') return '当前对话最近一张用户上传图片'
+  if (selector === 'first') return '当前对话第 1 张用户上传图片'
+  const ordinal = /^(?:index:)?(\d+)$/.exec(selector)
+  if (ordinal) return `当前对话第 ${Number(ordinal[1])} 张用户上传图片`
+  return `当前对话附件 ${selector}`
+}
+
+function describeImageInput(input: unknown): string {
+  const value = String(input ?? '')
+  if (!value.startsWith('dsh-attachment:')) return value
+  return describeSessionImageSelector(value.slice('dsh-attachment:'.length).trim() || 'latest')
+}
+
+function supportedModelsForIntent(intent: 'image_gen' | 'image_edit' | 'video_gen'): readonly string[] {
+  return intent === 'video_gen' ? VIDEO_MODELS : intent === 'image_edit' ? IMAGE_EDIT_MODELS : IMAGE_MODELS
+}
+
+function defaultModelForIntent(intent: 'image_gen' | 'image_edit' | 'video_gen', config: MediaConfig): string {
+  return intent === 'video_gen' ? config.defaultVideoModel : intent === 'image_edit' ? config.defaultEditModel : config.defaultImageModel
+}
+
+function trimOptionalString(params: AnyRecord, key: string): void {
+  if (params[key] === undefined) return
+  if (typeof params[key] !== 'string') throw new Error(`${key} must be a string.`)
+  const value = params[key].trim()
+  if (value) params[key] = value
+  else delete params[key]
+}
+
+function normalizeWizardKnown(intent: 'image_gen' | 'image_edit' | 'video_gen', known: unknown, exec: AnyRecord): AnyRecord {
+  if (known !== undefined && (known === null || typeof known !== 'object' || Array.isArray(known))) {
+    throw new Error('known must be an object.')
+  }
+  const params: AnyRecord = { ...((known as AnyRecord | undefined) ?? {}) }
+  delete params.modelExplicit
+  for (const key of ['prompt', 'originalPrompt', 'promptSource', 'model', 'image', 'aspect_ratio', 'resolution', 'image_url', 'start_image', 'end_image']) {
+    trimOptionalString(params, key)
+  }
+  if (intent === 'image_edit' && !params.image && sessionUserImageRefs(exec).length === 1) params.image = 'dsh-attachment:latest'
+  if (params.promptSource !== undefined && !['user', 'inferred', 'wizard'].includes(params.promptSource)) {
+    throw new Error('promptSource must be user, inferred, or wizard.')
+  }
+  for (const key of ['enhanced', 'useDefaultModel', 'skipFinalConfirmation']) {
+    if (params[key] !== undefined && typeof params[key] !== 'boolean') throw new Error(`${key} must be a boolean.`)
+  }
+  for (const key of ['n', 'duration']) {
+    if (params[key] !== undefined && (!Number.isInteger(params[key]) || params[key] <= 0)) throw new Error(`${key} must be a positive integer.`)
+  }
+  if (params.reference_images !== undefined) {
+    if (!Array.isArray(params.reference_images) || params.reference_images.some((value: unknown) => typeof value !== 'string' || !value.trim())) {
+      throw new Error('reference_images must be an array of non-empty strings.')
+    }
+    params.reference_images = params.reference_images.map((value: string) => value.trim())
+  }
+  if (params.model && params.useDefaultModel === true) throw new Error('model and useDefaultModel cannot both be set.')
+  return params
+}
+
+function validateWizardKnown(intent: 'image_gen' | 'image_edit' | 'video_gen', params: AnyRecord, config: MediaConfig): void {
+  const supportedModels = supportedModelsForIntent(intent)
+  if (params.model && !supportedModels.includes(params.model)) {
+    throw new Error(`Model ${params.model} is not supported for ${intent}. Choose one of: ${supportedModels.join(', ')}.`)
+  }
+  const ratios: readonly string[] = intent === 'image_gen' ? IMAGE_ASPECT_RATIOS : ASPECT_RATIOS
+  if (params.aspect_ratio && !ratios.includes(params.aspect_ratio)) {
+    throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported for ${intent}. Choose one of: ${ratios.join(', ')}.`)
+  }
+  if ((intent === 'image_gen' || intent === 'image_edit') && params.n !== undefined && ![1, 2, 4].includes(params.n)) {
+    throw new Error('Image count n must be 1, 2, or 4.')
+  }
+  if (intent === 'video_gen') {
+    const effectiveModel = params.model ?? defaultModelForIntent(intent, config)
+    const durations = effectiveModel === 'seedance_2_0' ? [5, 8, 10, 15] : [3, 5, 8]
+    if (params.duration !== undefined && !durations.includes(params.duration)) {
+      throw new Error(`Duration ${params.duration} is not supported by ${effectiveModel}. Choose one of: ${durations.join(', ')}.`)
+    }
+    if (params.resolution && effectiveModel !== 'seedance_2_0') {
+      throw new Error('resolution is only supported when the effective video model is seedance_2_0.')
+    }
+    if (params.resolution && !(SEEDANCE_RESOLUTIONS as readonly string[]).includes(params.resolution)) {
+      throw new Error(`Resolution ${params.resolution} is not supported. Choose one of: ${SEEDANCE_RESOLUTIONS.join(', ')}.`)
+    }
+  }
+}
+
 function imageBlocks(images: GeneratedImage[], label: string, model: string, taskId: string): AnyRecord[] {
   const blocks: AnyRecord[] = []
   for (const image of images) {
@@ -191,18 +380,40 @@ function imageOutputSchema(): AnyRecord {
   }
 }
 
-async function prepareInput(config: MediaConfig, api: TokensApiClient, input: string, signal?: AbortSignal): Promise<string> {
-  const trimmed = String(input).trim()
+async function prepareInput(config: MediaConfig, api: TokensApiClient, input: unknown, exec: AnyRecord, attachments: AnyRecord): Promise<string> {
+  const trimmed = String(input ?? 'dsh-attachment:latest').trim()
+  if (trimmed.startsWith('dsh-attachment:')) {
+    if (!exec.agent) throw new Error('Chat attachment input requires a session-scoped tool call.')
+    if (!attachments?.readImage) throw new Error('DSH attachment storage is unavailable.')
+    const selector = trimmed.slice('dsh-attachment:'.length).trim() || 'latest'
+    const ref = resolveSessionImageRef(exec, selector)
+    if (!ref) {
+      const count = sessionUserImageRefs(exec).length
+      throw new Error(selector === 'latest'
+        ? 'No user-uploaded image was found in the current conversation.'
+        : `Image selector ${selector} did not match the current conversation's ${count} user-uploaded image(s). Use latest, first, last, a 1-based number, index:N, or a current-conversation attachment id.`)
+    }
+    const stored = await attachments.readImage(ref, exec.signal)
+    if (!stored?.data) throw new Error('DSH attachment storage returned no image bytes.')
+    if (stored.data.byteLength > config.maxInputImageBytes) throw new Error(`Image input exceeds the ${config.maxInputImageBytes} byte limit.`)
+    const mediaType = stored.ref?.mediaType ?? ref.mediaType
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mediaType)) {
+      throw new Error(`Unsupported chat attachment image type: ${mediaType ?? 'unknown'}`)
+    }
+    const dataUrl = `data:${mediaType};base64,${Buffer.from(stored.data).toString('base64')}`
+    return api.uploadImage(dataUrl, exec.signal)
+  }
   if (!config.allowLocalImageInput && !/^https:\/\//i.test(trimmed)) {
     throw new Error('Local image input is disabled by plugin configuration.')
   }
   const resolved = await resolveImageInput(trimmed, config.maxInputImageBytes)
   if (resolved.source === 'remote') return resolved.value
-  return api.uploadImage(resolved.value, signal)
+  return api.uploadImage(resolved.value, exec.signal)
 }
 
 export function apply(ctx: AnyRecord, config: MediaConfig): void {
   const api = new TokensApiClient(ctx as any, config)
+  registerDownloadRoute(ctx)
   registerVideoRoute(ctx, config)
   const attachments = ctx.get('attachments')
   const register = (spec: AnyRecord) => ctx.tools.register(defineTool(spec as any))
@@ -210,15 +421,25 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
   ctx.systemPrompt.section({
     name: 'media-gen:wizard',
     order: 200,
-    text: 'Before image generation, image editing, or video generation, call media_wizard and complete its ordered confirmation flow. The wizard must confirm the prompt, model strategy, output parameters, and final summary. If the user chooses the plugin default model, do not pass model to the generation tool; only pass model after an explicit model choice.',
+    text: `Before calling media_wizard, first infer the user's media intent and extract every relevant parameter already supplied by the user or current conversation into known. media_wizard is a missing-parameter completer, not a fixed questionnaire: do not ask the user to repeat information already present.
+
+Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". For image editing, when the current or immediately preceding user request contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the user's requested change as prompt. When the user refers to an ordered image, use a 1-based selector such as dsh-attachment:1 or dsh-attachment:2; first, last, and index:N are also supported. Use a full current-conversation attachment id when it is available. If multiple images exist and the target or role is ambiguous, leave the image field absent so the wizard can ask instead of guessing. Extract explicit model, aspect ratio, image count, duration, resolution, input-image roles, and prompt-enhancement preference when stated. Leave genuinely unspecified or ambiguous values absent so the wizard can ask only for those values. Never invent a local path or URL for a chat attachment.
+
+Known-field contract: prompt is the user's requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when the user explicitly chose enhancement behavior; model is present only for an explicit supported model choice; useDefaultModel is true only when the user explicitly chose the plugin default; aspect_ratio, n, duration, resolution, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived. Set skipFinalConfirmation only when the user explicitly asks to proceed without further confirmation; never infer it merely because the request seems complete.
+
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.`,
   })
 
   register({
     name: 'media_wizard',
-    description: 'Guided media generation wizard. Run before media_generate_image, media_edit_image, or media_generate_video.',
+    description: 'Context-aware media task wizard. Infer intent and pass all user-supplied parameters in known; it asks only for missing values before media generation or editing.',
     parameters: {
       intent: { type: 'string', enum: ['image_gen', 'image_edit', 'video_gen'], required: true },
-      known: { type: 'object', additionalProperties: true },
+      known: {
+        type: 'object',
+        additionalProperties: true,
+        description: 'Parameters already supplied or unambiguously derived from the user request. Supported fields include prompt, promptSource, enhanced, model, useDefaultModel, skipFinalConfirmation, image, aspect_ratio, n, duration, resolution, image_url, start_image, end_image, and reference_images. Do not invent missing values.',
+      },
     },
     output: {
       schema: {
@@ -249,82 +470,71 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
     },
     async execute(args: AnyRecord, exec: AnyRecord) {
       const intent = args.intent as 'image_gen' | 'image_edit' | 'video_gen'
-      const params: AnyRecord = { ...(args.known ?? {}) }
-      delete params.modelExplicit
+      const params = normalizeWizardKnown(intent, args.known, exec)
+      validateWizardKnown(intent, params, config)
+      const promptProvidedBeforeWizard = Boolean(params.prompt)
+      if (promptProvidedBeforeWizard && !params.promptSource) params.promptSource = 'user'
       let needsImage = false
       let promptConfirmed = false
       let modelChoiceConfirmed = false
       let modelExplicit = false
       let finalConfirmed = false
-      const result = () => ({
-        intent,
-        confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed,
-        promptConfirmed,
-        modelChoiceConfirmed,
-        modelExplicit,
-        finalConfirmed,
-        needsImage,
-        params,
-      })
+      const result = () => ({ intent, confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed, promptConfirmed, modelChoiceConfirmed, modelExplicit, finalConfirmed, needsImage, params })
       try {
         if (intent === 'image_edit' && !params.image) {
-          const answers = await ask(ctx, exec, [{
-            id: 'image', header: '参考图', question: '请选择已附加的图片，或输入 HTTPS URL / 本地图片路径',
-          }])
-          params.image = selected(answers.image)
-          if (!params.image) {
-            needsImage = true
-            return result()
+          const imageCount = sessionUserImageRefs(exec).length
+          if (imageCount === 1) params.image = 'dsh-attachment:latest'
+          else {
+            const answers = await ask(ctx, exec, [{
+              id: 'image', header: '参考图',
+              question: imageCount > 1
+                ? `当前对话有 ${imageCount} 张用户上传图片。请输入 dsh-attachment:1 至 dsh-attachment:${imageCount}，或输入 HTTPS URL / 本地图片路径`
+                : '当前对话中没有用户上传的图片。请输入 HTTPS URL / 本地图片路径',
+            }])
+            params.image = selected(answers.image)
+            if (!params.image) { needsImage = true; return result() }
           }
         }
         if (intent === 'video_gen') {
           const hasInput = params.image_url || params.start_image || params.end_image || (Array.isArray(params.reference_images) && params.reference_images.length)
-          if (!hasInput) {
-            const answers = await ask(ctx, exec, [{
-              id: 'video_input', header: '视频类型', question: '选择视频生成方式',
-              options: [{ label: '纯文生视频 (Recommended)' }, { label: '使用首帧图片' }, { label: '使用首帧和尾帧图片' }],
-            }])
+          if (!hasInput && !params.prompt) {
+            const answers = await ask(ctx, exec, [{ id: 'video_input', header: '视频类型', question: '选择视频生成方式', options: [{ label: '纯文生视频 (Recommended)' }, { label: '使用首帧图片' }, { label: '使用首帧和尾帧图片' }] }])
             const choice = stripRecommended(selected(answers.video_input))
             if (!choice) return result()
             if (choice === '使用首帧图片') {
-              const imageAnswers = await ask(ctx, exec, [{ id: 'start_image', header: '首帧图片', question: '请选择已附加的首帧图片，或输入 HTTPS URL / 本地图片路径' }])
+              const imageAnswers = await ask(ctx, exec, [{ id: 'start_image', header: '首帧图片', question: '请选择已附加的首帧图片，或输入 dsh-attachment 选择器 / HTTPS URL / 本地图片路径' }])
               params.start_image = selected(imageAnswers.start_image)
-              if (!params.start_image) {
-                needsImage = true
-                return result()
-              }
+              if (!params.start_image) { needsImage = true; return result() }
             }
             if (choice === '使用首帧和尾帧图片') {
               const imageAnswers = await ask(ctx, exec, [
-                { id: 'start_image', header: '首帧图片', question: '请选择已附加的首帧图片，或输入 HTTPS URL / 本地图片路径' },
-                { id: 'end_image', header: '尾帧图片', question: '请选择已附加的尾帧图片，或输入 HTTPS URL / 本地图片路径' },
+                { id: 'start_image', header: '首帧图片', question: '请选择首帧图片，或输入 dsh-attachment 选择器 / HTTPS URL / 本地图片路径' },
+                { id: 'end_image', header: '尾帧图片', question: '请选择尾帧图片，或输入 dsh-attachment 选择器 / HTTPS URL / 本地图片路径' },
               ])
               params.start_image = selected(imageAnswers.start_image)
               params.end_image = selected(imageAnswers.end_image)
-              if (!params.start_image || !params.end_image) {
-                needsImage = true
-                return result()
-              }
+              if (!params.start_image || !params.end_image) { needsImage = true; return result() }
             }
           }
         }
-
         if (!params.prompt) {
-          const answers = await ask(ctx, exec, [{
-            id: 'prompt',
-            header: '原始 Prompt',
-            question: intent === 'image_edit' ? '请描述你想怎么修改图片' : intent === 'video_gen' ? '请描述你想生成的视频' : '请描述你想生成的图片',
-          }])
+          const answers = await ask(ctx, exec, [{ id: 'prompt', header: '原始 Prompt', question: intent === 'image_edit' ? '请描述你想怎么修改图片' : intent === 'video_gen' ? '请描述你想生成的视频' : '请描述你想生成的图片' }])
           params.prompt = selected(answers.prompt)
           if (!params.prompt) return result()
+          params.prompt = String(params.prompt).trim()
+          params.promptSource = 'wizard'
         }
-
+        if (params.enhanced === true && !config.enhanceEnabled) throw new Error('Prompt enhancement was requested, but enhancement is disabled by plugin configuration.')
+        if (params.enhanced === true && !params.originalPrompt) {
+          const original = params.prompt
+          const enhanced = await api.enhance(intent, original, exec.signal)
+          params.originalPrompt = original
+          params.prompt = enhanced
+          params.enhanced = enhanced !== original
+        }
         if (params.enhanced === undefined) {
           const enhanceOptions = config.enhanceEnabled
-            ? [
-                { label: '增强 Prompt (Recommended)', description: '优化视觉、镜头和质量细节' },
-                { label: '保持原始 Prompt', description: '不修改内容描述' },
-              ]
+            ? [{ label: '增强 Prompt (Recommended)', description: '优化视觉、镜头和质量细节' }, { label: '保持原始 Prompt', description: '不修改内容描述' }]
             : [{ label: '保持原始 Prompt (Recommended)', description: '当前未启用提示词增强服务' }]
           const answers = await ask(ctx, exec, [{ id: 'enhance', header: 'Prompt 增强', question: '是否增强 Prompt？', options: enhanceOptions }])
           const choice = stripRecommended(selected(answers.enhance))
@@ -335,71 +545,38 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
             params.originalPrompt = original
             params.prompt = enhanced
             params.enhanced = enhanced !== original
-          } else {
-            params.enhanced = false
-          }
+          } else params.enhanced = false
         }
-
-        const promptAnswers = await ask(ctx, exec, [{
-          id: 'prompt_confirm', header: '确认 Prompt', question: '是否使用这个最终 Prompt？', detail: String(params.prompt),
-          options: [{ label: '确认 Prompt (Recommended)' }, { label: '取消' }],
-        }])
-        promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === '确认 Prompt'
+        const promptWasEnhanced = Boolean(params.originalPrompt && params.prompt !== params.originalPrompt)
+        if (promptWasEnhanced) {
+          const promptAnswers = await ask(ctx, exec, [{ id: 'prompt_confirm', header: '确认增强后 Prompt', question: 'Prompt 已被增强，是否使用增强后的内容？', detail: `原始 Prompt:\n${params.originalPrompt}\n\n增强后 Prompt:\n${params.prompt}`, options: [{ label: '确认增强后 Prompt (Recommended)' }, { label: '取消' }] }])
+          promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === '确认增强后 Prompt'
+        } else promptConfirmed = Boolean(params.prompt)
         if (!promptConfirmed) return result()
-
-        const selectableModels = intent === 'video_gen'
-          ? VIDEO_MODELS
-          : intent === 'image_edit'
-            ? IMAGE_EDIT_MODELS
-            : IMAGE_MODELS
-        const defaultModel = intent === 'video_gen'
-          ? config.defaultVideoModel
-          : intent === 'image_edit'
-            ? config.defaultEditModel
-            : config.defaultImageModel
-        const defaultModelLabel = `${defaultModel}（插件默认，推荐）`
-        const modelOptions = [
-          { label: defaultModelLabel, description: '使用插件当前配置的默认模型' },
-          ...selectableModels.filter((model) => model !== defaultModel).map((model) => ({ label: model })),
-        ]
-        const modelAnswers = await ask(ctx, exec, [{ id: 'model', header: '模型', question: '选择模型', options: modelOptions }])
-        const rawModelChoice = selected(modelAnswers.model)
-        if (!rawModelChoice) return result()
-        const usesPluginDefault = rawModelChoice === defaultModelLabel
-        const modelChoice = usesPluginDefault ? defaultModel : stripRecommended(rawModelChoice)
-        modelChoiceConfirmed = true
-        if (usesPluginDefault) {
-          delete params.model
-          modelExplicit = false
+        const selectableModels = supportedModelsForIntent(intent)
+        const defaultModel = defaultModelForIntent(intent, config)
+        if (params.model) {
+          modelChoiceConfirmed = true; modelExplicit = true; delete params.useDefaultModel
+        } else if (params.useDefaultModel === true) {
+          modelChoiceConfirmed = true; modelExplicit = false; delete params.model
         } else {
-          params.model = modelChoice
-          modelExplicit = true
+          const defaultModelLabel = `${defaultModel}（插件默认，推荐）`
+          const modelOptions = [{ label: defaultModelLabel, description: '使用插件当前配置的默认模型' }, ...selectableModels.filter((model) => model !== defaultModel).map((model) => ({ label: model }))]
+          const modelAnswers = await ask(ctx, exec, [{ id: 'model', header: '模型', question: '选择模型', options: modelOptions }])
+          const rawModelChoice = selected(modelAnswers.model)
+          if (!rawModelChoice) return result()
+          const usesPluginDefault = rawModelChoice === defaultModelLabel
+          modelChoiceConfirmed = true
+          if (usesPluginDefault) { params.useDefaultModel = true; delete params.model; modelExplicit = false }
+          else { params.model = stripRecommended(rawModelChoice); delete params.useDefaultModel; modelExplicit = true }
         }
-
-        const effectiveVideoModel = intent === 'video_gen' ? (params.model ?? config.defaultVideoModel) : undefined
+        const effectiveVideoModel = intent === 'video_gen' ? (params.model ?? defaultModel) : undefined
         const outputQuestions: AnyRecord[] = []
-        if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({
-          id: 'aspect_ratio', header: '画面比例', question: '选择画面比例',
-          options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === '1:1' ? `${ratio} (Recommended)` : ratio })),
-        })
-        if ((intent === 'image_edit' || intent === 'video_gen') && !params.aspect_ratio) outputQuestions.push({
-          id: 'aspect_ratio', header: '画面比例', question: '选择画面比例',
-          options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio })),
-        })
-        if (intent === 'video_gen' && !params.duration) outputQuestions.push({
-          id: 'duration', header: '时长', question: '选择视频时长',
-          options: effectiveVideoModel === 'seedance_2_0'
-            ? [{ label: '5 秒 (Recommended)' }, { label: '8 秒' }, { label: '10 秒' }, { label: '15 秒' }]
-            : [{ label: '5 秒 (Recommended)' }, { label: '3 秒' }, { label: '8 秒' }],
-        })
-        if (intent === 'video_gen' && effectiveVideoModel === 'seedance_2_0' && !params.resolution) outputQuestions.push({
-          id: 'resolution', header: '分辨率', question: '选择视频分辨率',
-          options: SEEDANCE_RESOLUTIONS.map((resolution) => ({ label: resolution === '720p' ? `${resolution} (Recommended)` : resolution })),
-        })
-        if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({
-          id: 'n', header: '数量', question: '生成几张？',
-          options: [{ label: '1 张 (Recommended)' }, { label: '2 张' }, { label: '4 张' }],
-        })
+        if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === '1:1' ? `${ratio} (Recommended)` : ratio })) })
+        if ((intent === 'image_edit' || intent === 'video_gen') && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio })) })
+        if (intent === 'video_gen' && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: effectiveVideoModel === 'seedance_2_0' ? [{ label: '5 秒 (Recommended)' }, { label: '8 秒' }, { label: '10 秒' }, { label: '15 秒' }] : [{ label: '5 秒 (Recommended)' }, { label: '3 秒' }, { label: '8 秒' }] })
+        if (intent === 'video_gen' && effectiveVideoModel === 'seedance_2_0' && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: SEEDANCE_RESOLUTIONS.map((resolution) => ({ label: resolution === '720p' ? `${resolution} (Recommended)` : resolution })) })
+        if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({ id: 'n', header: '数量', question: '生成几张？', options: [{ label: '1 张 (Recommended)' }, { label: '2 张' }, { label: '4 张' }] })
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions)
           if (answers.aspect_ratio) params.aspect_ratio = stripRecommended(selected(answers.aspect_ratio))
@@ -407,35 +584,39 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
           if (answers.resolution) params.resolution = stripRecommended(selected(answers.resolution))
           if (answers.n) params.n = numberLabel(selected(answers.n))
         }
-        const requiredParametersPresent = Boolean(params.aspect_ratio)
-          && (intent === 'video_gen'
-            ? Boolean(params.duration) && (effectiveVideoModel !== 'seedance_2_0' || Boolean(params.resolution))
-            : Boolean(params.n))
+        validateWizardKnown(intent, params, config)
+        const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === 'video_gen' ? Boolean(params.duration) && (effectiveVideoModel !== 'seedance_2_0' || Boolean(params.resolution)) : Boolean(params.n))
         if (!requiredParametersPresent) return result()
-
+        const taskLabel = intent === 'image_edit' ? '图片编辑' : intent === 'video_gen' ? '视频生成' : '图片生成'
+        const inputLines = intent === 'image_edit'
+          ? [`- 参考图: ${describeImageInput(params.image)}`]
+          : intent === 'video_gen'
+            ? [
+                ...(params.start_image || params.image_url ? [`- 首帧图片: ${describeImageInput(params.start_image ?? params.image_url)}`] : []),
+                ...(params.end_image ? [`- 尾帧图片: ${describeImageInput(params.end_image)}`] : []),
+                ...(Array.isArray(params.reference_images) && params.reference_images.length ? [`- 参考图片: ${params.reference_images.map(describeImageInput).join(', ')}`] : []),
+              ]
+            : []
         const parameterLines = [
-          `- 画面比例: ${params.aspect_ratio}`,
+          `- 任务: ${taskLabel}`, ...inputLines, `- 内容: ${params.prompt}`,
+          `- Prompt 来源: ${params.promptSource ?? (promptProvidedBeforeWizard ? 'user' : 'wizard')}`,
+          `- Prompt 增强: ${promptWasEnhanced ? '已增强' : '未增强'}`,
+          `- 模型: ${params.model ?? `${defaultModel}（插件默认）`}`, `- 画面比例: ${params.aspect_ratio}`,
           ...(params.duration ? [`- 时长: ${params.duration} 秒`] : []),
           ...(intent === 'video_gen' ? [`- 分辨率: ${params.resolution ?? '模型工作流默认值'}`] : []),
           ...(params.n ? [`- 数量: ${params.n} 张`] : []),
-          ...(needsImage ? ['- 图片输入: 需要提供'] : []),
         ]
-        const finalLines = [
-          `- 内容: ${params.prompt}`,
-          `- 模型: ${params.model ?? `${defaultModel}（插件默认）`}`,
-          ...parameterLines,
-        ]
-        const finalAnswers = await ask(ctx, exec, [{
-          id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: finalLines.join('\n'),
-          options: [{ label: '确认生成 (Recommended)' }, { label: '取消' }],
-        }])
-        finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === '确认生成'
+        if (params.skipFinalConfirmation === true) finalConfirmed = true
+        else {
+          const finalAnswers = await ask(ctx, exec, [{ id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: parameterLines.join('\n'), options: [{ label: '确认生成 (Recommended)' }, { label: '取消' }] }])
+          finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === '确认生成'
+        }
         return result()
       } catch (error: any) {
         if (error?.code === 'ASK_CANCELLED') return result()
         throw error
       }
-    },
+    }
   })
 
   register({
@@ -457,16 +638,17 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
       const data = await api.poll(taskId, exec.signal)
       const timedOut = data.timedOut === true
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal)
+      if (!timedOut && images.length > 0) exec.concludeTurn()
       return { taskId, model, images, ...(timedOut ? { timedOut: true } : {}) }
     },
   })
 
   register({
     name: 'media_edit_image',
-    description: 'Edit an image with TokensAPI. HTTPS URLs and local/data images are supported; local images use TokensAPI first-party presigned upload without third-party hosting.',
+    description: 'Edit an image with TokensAPI. Omit image to use the latest user-uploaded image in the current conversation; HTTPS URLs and local/data images are also supported.',
     parameters: {
       prompt: { type: 'string', required: true },
-      image: { type: 'string', required: true },
+      image: { type: 'string', description: 'Optional image source: dsh-attachment:latest, first, last, a 1-based selector such as dsh-attachment:2, index:N, a current-conversation attachment id, HTTPS URL, local path, or data URL. Defaults to the latest user-uploaded conversation image.' },
       model: { type: 'string', enum: [...IMAGE_EDIT_MODELS] },
       aspect_ratio: { type: 'string', enum: [...ASPECT_RATIOS] },
       n: { type: 'integer' },
@@ -480,7 +662,7 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
       if (!(IMAGE_EDIT_MODELS as readonly string[]).includes(model)) {
         throw new Error(`Model ${model} does not support image editing. Choose image2 or qwen_image.`)
       }
-      const image = await prepareInput(config, api, args.image, exec.signal)
+      const image = await prepareInput(config, api, args.image, exec, attachments)
       const body = {
         model,
         prompt: args.prompt,
@@ -492,6 +674,7 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
       const data = await api.poll(taskId, exec.signal)
       const timedOut = data.timedOut === true
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal)
+      if (!timedOut && images.length > 0) exec.concludeTurn()
       return { taskId, model, images, ...(timedOut ? { timedOut: true } : {}) }
     },
   })
@@ -528,17 +711,17 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
 
   register({
     name: 'media_generate_video',
-    description: 'Generate a short TokensAPI video. Supports text and first/last frame images. Local images use TokensAPI first-party presigned upload.',
+    description: 'Generate a short TokensAPI video. Supports text and first/last frame images; image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.',
     parameters: {
       prompt: { type: 'string', required: true },
       model: { type: 'string', enum: [...VIDEO_MODELS] },
       duration: { type: 'integer', enum: [...DURATIONS] },
       resolution: { type: 'string', enum: [...SEEDANCE_RESOLUTIONS] },
       aspect_ratio: { type: 'string', enum: [...ASPECT_RATIOS] },
-      image_url: { type: 'string' },
-      reference_images: { type: 'array', items: { type: 'string' } },
-      start_image: { type: 'string' },
-      end_image: { type: 'string' },
+      image_url: { type: 'string', description: 'Legacy first-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL.' },
+      reference_images: { type: 'array', items: { type: 'string' }, description: 'Reference image inputs support dsh-attachment selectors, although the current production video contract may reject generic references.' },
+      start_image: { type: 'string', description: 'First-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL.' },
+      end_image: { type: 'string', description: 'Last-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL.' },
     },
     output: { schema: videoSchema, render: renderVideo },
     async execute(args: AnyRecord, exec: AnyRecord) {
@@ -546,11 +729,12 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
       const model = args.model ?? config.defaultVideoModel
       if (args.resolution && model !== 'seedance_2_0') throw new Error('resolution is configurable only for seedance_2_0; ltx_2_3 uses its workflow default.')
       if (Array.isArray(args.reference_images) && args.reference_images.length > 0) {
+        await Promise.all(args.reference_images.map((input: string) => prepareInput(config, api, input, exec, attachments)))
         throw new Error('The current TokensAPI production video contract supports first/last frame_images, not generic reference_images.')
       }
       const firstInput = args.start_image ?? args.image_url
-      const startImage = typeof firstInput === 'string' ? await prepareInput(config, api, firstInput, exec.signal) : undefined
-      const endImage = typeof args.end_image === 'string' ? await prepareInput(config, api, args.end_image, exec.signal) : undefined
+      const startImage = typeof firstInput === 'string' ? await prepareInput(config, api, firstInput, exec, attachments) : undefined
+      const endImage = typeof args.end_image === 'string' ? await prepareInput(config, api, args.end_image, exec, attachments) : undefined
       const frameImages = [
         ...(startImage ? [{ type: 'image_url', frame_type: 'first_frame', image_url: { url: startImage } }] : []),
         ...(endImage ? [{ type: 'image_url', frame_type: 'last_frame', image_url: { url: endImage } }] : []),
@@ -570,6 +754,7 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
       const url = api.urls(data)[0]
       const saved = await saveVideo(url, taskId, config, exec.signal)
       const media = data.media && typeof data.media === 'object' ? data.media as AnyRecord : {}
+      if (url) exec.concludeTurn()
       return {
         taskId,
         model,
@@ -601,7 +786,7 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
 
   register({
     name: 'media_task_status',
-    description: 'Check and recover a TokensAPI media task. Completed images are saved as DSH attachments; completed videos are saved locally.',
+    description: 'Check and recover a TokensAPI media task. Completed images are saved as DSH attachments; completed videos remain available by remote URL and explicit download.',
     parameters: {
       task_id: { type: 'string', required: true },
       kind: { type: 'string', enum: ['auto', 'images', 'videos'] },
@@ -644,9 +829,11 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
         : data.media && typeof data.media === 'object' ? 'videos' : urls.some((url) => /\.(?:mp4|webm)(?:\?|$)/i.test(url)) ? 'videos' : 'images'
       if (detectedKind === 'videos') {
         const saved = await saveVideo(urls[0], args.task_id, config, exec.signal)
+        if (urls[0]) exec.concludeTurn()
         return { taskId: args.task_id, status, progress, kind: 'videos', ...saved }
       }
       const images = await saveImages(urls, args.task_id, attachments, exec.signal)
+      if (images.length > 0) exec.concludeTurn()
       return { taskId: args.task_id, status, progress, kind: 'images', images }
     },
   })

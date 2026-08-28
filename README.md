@@ -1,10 +1,12 @@
-# @tokens/dsh-media-gen
+# @tokensapi/dsh-media-gen
 
-TokensAPI image and video generation tools for DeepSeek Harness.
+Context-aware TokensAPI image and video generation tools for DeepSeek Harness.
+
+This package is maintained under the `@tokensapi` npm scope and is derived from the upstream [`@tokens/dsh-media-gen`](https://github.com/TokensAPI/tokens_DshMediaGen_code) project.
 
 ## Compatibility
 
-The `0.2.x` series targets and is validated against:
+The `0.3.x` series targets and is validated against:
 
 - DeepSeek Harness / DSH `0.1.0-rc.8`
 - Node.js `^22.19.0 || >=24.0.0`
@@ -20,14 +22,16 @@ Other DSH versions are not yet guaranteed.
 - DSH attachment-backed inline image rendering;
 - Inline remote video playback plus local MP4 saving;
 - Timed-out task status and result recovery;
-- Guided media wizard;
+- Context-aware missing-parameter media wizard;
+- Direct current-conversation DSH attachment input with ordered multi-image selectors;
+- TokensAPI presigned or configurable R2/S3 reference-image upload;
 - Prompt enhancement enabled by default through TokensAPI (`deepseek-v4-flash`).
 
 ## Privacy
 
 TokensAPI production task endpoints require publicly accessible HTTPS reference images. The plugin never uploads local images to third-party temporary hosts such as uguu.se or tmpfiles.org.
 
-Local images use the TokensAPI first-party presigned flow: `POST /api/aigc/presign`, raw-byte `PUT` to `upload_url`, then `access_url` in the generation request. No third-party image host is used. Production currently requires an account access token and numeric user id; the plugin also supports API-key mode for deployments that enable `TokenOrUserAuth` on the presign route.
+Local images and current-conversation DSH attachments use first-party storage. The default flow uses `POST /api/aigc/presign`, raw-byte `PUT` to `upload_url`, then `access_url` in the generation request. A configurable `storageBackend: r2` path signs direct Cloudflare R2/S3 uploads with Signature V4. No third-party temporary image host is used. DSH attachments are read through the official `attachments.readImage()` service rather than exposing or guessing original local paths.
 
 ## Installation
 
@@ -36,7 +40,7 @@ Register the package in the active DSH profile:
 ```yaml
 - insert:
     - id: media-gen
-      name: '@tokens/dsh-media-gen'
+      name: '@tokensapi/dsh-media-gen'
 ```
 
 Configure the required DSH credential:
