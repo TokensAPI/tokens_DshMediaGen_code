@@ -12,12 +12,29 @@ import {
   IMAGE_EDIT_MODELS,
   IMAGE_ASPECT_RATIOS,
   SEEDANCE_RESOLUTIONS,
+  VIDEO_ASPECT_RATIOS,
   VIDEO_MODELS,
   resolveImageInput,
+  videoModelCapability,
 } from '../shared/media.js'
 import { saveImages, saveVideo } from './results.js'
 import { TokensApiClient } from './tokensapi.js'
 export { TokensApiClient } from './tokensapi.js'
+export {
+  VIDEO_MODEL_CAPABILITIES,
+  VIDEO_MODEL_IDS,
+  VIDEO_MODELS,
+  isVideoModel,
+  videoModelCapability,
+} from '../shared/media.js'
+export type {
+  VideoAudioMode,
+  VideoGenerateAudioParameter,
+  VideoInputMode,
+  VideoModel,
+  VideoModelCapability,
+} from '../shared/media.js'
+import type { VideoInputMode, VideoModel } from '../shared/media.js'
 import type { GeneratedImage, MediaConfig } from './types.js'
 
 export const name = 'media-gen'
@@ -31,7 +48,7 @@ export const Config = Schema.object({
   maxPollMs: Schema.number().default(12 * 60 * 1000),
   defaultImageModel: Schema.union([...IMAGE_MODELS]).default('z_image_turbo'),
   defaultEditModel: Schema.union([...IMAGE_EDIT_MODELS]).default('qwen_image'),
-  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default('ltx_2_3'),
+  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default('ltx_2_5'),
   enhanceEnabled: Schema.boolean().default(true),
   enhanceApiKeyEnv: Schema.string().role('credential-ref').default('TOKENSAPI_API_KEY'),
   enhanceBaseURL: Schema.string().default('https://tokensapi.ai/v1'),
@@ -260,6 +277,42 @@ function defaultModelForIntent(intent: 'image_gen' | 'image_edit' | 'video_gen',
   return intent === 'video_gen' ? config.defaultVideoModel : intent === 'image_edit' ? config.defaultEditModel : config.defaultImageModel
 }
 
+function resolveEffectiveVideoModel(params: AnyRecord, config: MediaConfig): VideoModel {
+  const model = params.model ?? config.defaultVideoModel
+  if (!(VIDEO_MODELS as readonly string[]).includes(model)) throw new Error(`Unsupported video model: ${model}`)
+  return model as VideoModel
+}
+
+function videoInputMode(params: AnyRecord): VideoInputMode {
+  if (params.end_image) return 'first_last_frame'
+  if (params.start_image || params.image_url) return 'first_frame'
+  return 'text'
+}
+
+function videoAudioDescription(model: VideoModel, generateAudio: unknown): string {
+  const capability = videoModelCapability(model)
+  if (capability.audioMode === 'required') return '自动生成音频（模型固定开启）'
+  if (capability.audioMode === 'not_configurable') return '由模型工作流决定'
+  return generateAudio === false ? '关闭' : '开启'
+}
+
+function videoModelDescription(model: VideoModel): string {
+  const capability = videoModelCapability(model)
+  const audio = capability.audioMode === 'required' ? '固定音频' : capability.audioMode === 'optional' ? '音频可选' : '音频不可配置'
+  return `${capability.durations.join('/')} 秒 · ${capability.resolutions.join('/')} · ${audio}`
+}
+
+function videoAspectRatioLabel(ratio: string, inputMode: VideoInputMode): string {
+  if (ratio !== 'adaptive') return ratio
+  return inputMode === 'text'
+    ? 'adaptive（模型自动选择画面比例）'
+    : 'adaptive（自动匹配输入图片比例）'
+}
+
+function parseVideoAspectRatioLabel(value: unknown): string {
+  return stripRecommended(value).replace(/^adaptive（[^）]+）$/, 'adaptive')
+}
+
 function trimOptionalString(params: AnyRecord, key: string): void {
   if (params[key] === undefined) return
   if (typeof params[key] !== 'string') throw new Error(`${key} must be a string.`)
@@ -281,7 +334,7 @@ function normalizeWizardKnown(intent: 'image_gen' | 'image_edit' | 'video_gen', 
   if (params.promptSource !== undefined && !['user', 'inferred', 'wizard'].includes(params.promptSource)) {
     throw new Error('promptSource must be user, inferred, or wizard.')
   }
-  for (const key of ['enhanced', 'useDefaultModel', 'skipFinalConfirmation']) {
+  for (const key of ['enhanced', 'useDefaultModel', 'skipFinalConfirmation', 'generate_audio']) {
     if (params[key] !== undefined && typeof params[key] !== 'boolean') throw new Error(`${key} must be a boolean.`)
   }
   for (const key of ['n', 'duration']) {
@@ -302,24 +355,37 @@ function validateWizardKnown(intent: 'image_gen' | 'image_edit' | 'video_gen', p
   if (params.model && !supportedModels.includes(params.model)) {
     throw new Error(`Model ${params.model} is not supported for ${intent}. Choose one of: ${supportedModels.join(', ')}.`)
   }
-  const ratios: readonly string[] = intent === 'image_gen' ? IMAGE_ASPECT_RATIOS : ASPECT_RATIOS
-  if (params.aspect_ratio && !ratios.includes(params.aspect_ratio)) {
-    throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported for ${intent}. Choose one of: ${ratios.join(', ')}.`)
+  if (intent !== 'video_gen') {
+    const ratios: readonly string[] = intent === 'image_gen' ? IMAGE_ASPECT_RATIOS : ASPECT_RATIOS
+    if (params.aspect_ratio && !ratios.includes(params.aspect_ratio)) {
+      throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported for ${intent}. Choose one of: ${ratios.join(', ')}.`)
+    }
   }
   if ((intent === 'image_gen' || intent === 'image_edit') && params.n !== undefined && ![1, 2, 4].includes(params.n)) {
     throw new Error('Image count n must be 1, 2, or 4.')
   }
   if (intent === 'video_gen') {
-    const effectiveModel = params.model ?? defaultModelForIntent(intent, config)
-    const durations = effectiveModel === 'seedance_2_0' ? [5, 8, 10, 15] : [3, 5, 8]
-    if (params.duration !== undefined && !durations.includes(params.duration)) {
-      throw new Error(`Duration ${params.duration} is not supported by ${effectiveModel}. Choose one of: ${durations.join(', ')}.`)
+    const model = resolveEffectiveVideoModel(params, config)
+    const capability = videoModelCapability(model)
+    const inputMode = videoInputMode(params)
+    if (params.aspect_ratio && !capability.aspectRatios.includes(params.aspect_ratio as never)) {
+      throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported by ${model}. Choose one of: ${capability.aspectRatios.join(', ')}.`)
     }
-    if (params.resolution && effectiveModel !== 'seedance_2_0') {
-      throw new Error('resolution is only supported when the effective video model is seedance_2_0.')
+    const requiredAspectRatio = capability.requiredAspectRatioByInputMode?.[inputMode]
+    if (requiredAspectRatio && params.aspect_ratio && params.aspect_ratio !== requiredAspectRatio) {
+      throw new Error(`${model} ${inputMode} requires aspect_ratio=${requiredAspectRatio}.`)
     }
-    if (params.resolution && !(SEEDANCE_RESOLUTIONS as readonly string[]).includes(params.resolution)) {
-      throw new Error(`Resolution ${params.resolution} is not supported. Choose one of: ${SEEDANCE_RESOLUTIONS.join(', ')}.`)
+    if (params.duration !== undefined && !capability.durations.includes(params.duration as never)) {
+      throw new Error(`Duration ${params.duration} is not supported by ${model}. Choose one of: ${capability.durations.join(', ')}.`)
+    }
+    if (params.resolution && !capability.resolutions.includes(params.resolution as never)) {
+      throw new Error(`Resolution ${params.resolution} is not supported by ${model}. Choose one of: ${capability.resolutions.join(', ')}.`)
+    }
+    if (capability.audioMode === 'required' && params.generate_audio === false) {
+      throw new Error(`${model} requires generated audio to remain enabled.`)
+    }
+    if (capability.audioMode === 'not_configurable' && params.generate_audio !== undefined) {
+      throw new Error(`${model} does not expose a configurable audio parameter.`)
     }
   }
 }
@@ -423,11 +489,11 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
     order: 200,
     text: `Before calling media_wizard, first infer the user's media intent and extract every relevant parameter already supplied by the user or current conversation into known. media_wizard is a missing-parameter completer, not a fixed questionnaire: do not ask the user to repeat information already present.
 
-Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". For image editing, when the current or immediately preceding user request contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the user's requested change as prompt. When the user refers to an ordered image, use a 1-based selector such as dsh-attachment:1 or dsh-attachment:2; first, last, and index:N are also supported. Use a full current-conversation attachment id when it is available. If multiple images exist and the target or role is ambiguous, leave the image field absent so the wizard can ask instead of guessing. Extract explicit model, aspect ratio, image count, duration, resolution, input-image roles, and prompt-enhancement preference when stated. Leave genuinely unspecified or ambiguous values absent so the wizard can ask only for those values. Never invent a local path or URL for a chat attachment.
+Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". For image editing, when the current or immediately preceding user request contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the user's requested change as prompt. When the user refers to an ordered image, use a 1-based selector such as dsh-attachment:1 or dsh-attachment:2; first, last, and index:N are also supported. Use a full current-conversation attachment id when it is available. If multiple images exist and the target or role is ambiguous, leave the image field absent so the wizard can ask instead of guessing. Extract explicit model, aspect ratio, image count, duration, resolution, audio-generation preference, input-image roles, and prompt-enhancement preference when stated. Leave genuinely unspecified or ambiguous values absent so the wizard can ask only for those values. Never invent a local path or URL for a chat attachment.
 
-Known-field contract: prompt is the user's requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when the user explicitly chose enhancement behavior; model is present only for an explicit supported model choice; useDefaultModel is true only when the user explicitly chose the plugin default; aspect_ratio, n, duration, resolution, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived. Set skipFinalConfirmation only when the user explicitly asks to proceed without further confirmation; never infer it merely because the request seems complete.
+Known-field contract: prompt is the user's requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when the user explicitly chose enhancement behavior; model is present only for an explicit supported model choice; useDefaultModel is true only when the user explicitly chose the plugin default; aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived. Set skipFinalConfirmation only when the user explicitly asks to proceed without further confirmation; never infer it merely because the request seems complete.
 
-The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.`,
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice. For video generation, pass the wizard's generate_audio value to media_generate_video when present.`,
   })
 
   register({
@@ -438,7 +504,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
       known: {
         type: 'object',
         additionalProperties: true,
-        description: 'Parameters already supplied or unambiguously derived from the user request. Supported fields include prompt, promptSource, enhanced, model, useDefaultModel, skipFinalConfirmation, image, aspect_ratio, n, duration, resolution, image_url, start_image, end_image, and reference_images. Do not invent missing values.',
+        description: 'Parameters already supplied or unambiguously derived from the user request. Supported fields include prompt, promptSource, enhanced, model, useDefaultModel, skipFinalConfirmation, image, aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images. Do not invent missing values.',
       },
     },
     output: {
@@ -560,8 +626,13 @@ The wizard must complete any remaining confirmation flow before media_generate_i
         } else if (params.useDefaultModel === true) {
           modelChoiceConfirmed = true; modelExplicit = false; delete params.model
         } else {
-          const defaultModelLabel = `${defaultModel}（插件默认，推荐）`
-          const modelOptions = [{ label: defaultModelLabel, description: '使用插件当前配置的默认模型' }, ...selectableModels.filter((model) => model !== defaultModel).map((model) => ({ label: model }))]
+          const defaultModelLabel = `${defaultModel}（插件默认）`
+          const modelOptions = selectableModels.map((model) => ({
+            label: model === defaultModel ? defaultModelLabel : model,
+            ...(intent === 'video_gen'
+              ? { description: `${model === defaultModel ? '使用插件当前配置的默认模型；' : ''}${videoModelDescription(model as VideoModel)}` }
+              : model === defaultModel ? { description: '使用插件当前配置的默认模型' } : {}),
+          }))
           const modelAnswers = await ask(ctx, exec, [{ id: 'model', header: '模型', question: '选择模型', options: modelOptions }])
           const rawModelChoice = selected(modelAnswers.model)
           if (!rawModelChoice) return result()
@@ -570,22 +641,42 @@ The wizard must complete any remaining confirmation flow before media_generate_i
           if (usesPluginDefault) { params.useDefaultModel = true; delete params.model; modelExplicit = false }
           else { params.model = stripRecommended(rawModelChoice); delete params.useDefaultModel; modelExplicit = true }
         }
-        const effectiveVideoModel = intent === 'video_gen' ? (params.model ?? defaultModel) : undefined
+        const effectiveVideoModel = intent === 'video_gen' ? resolveEffectiveVideoModel(params, config) : undefined
+        const videoCapability = effectiveVideoModel ? videoModelCapability(effectiveVideoModel) : undefined
+        const selectedVideoInputMode = intent === 'video_gen' ? videoInputMode(params) : undefined
+        if (videoCapability && selectedVideoInputMode) {
+          const requiredAspectRatio = videoCapability.requiredAspectRatioByInputMode?.[selectedVideoInputMode]
+          if (requiredAspectRatio && !params.aspect_ratio) params.aspect_ratio = requiredAspectRatio
+          if (videoCapability.audioMode === 'required' && params.generate_audio === undefined) params.generate_audio = true
+        }
         const outputQuestions: AnyRecord[] = []
         if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === '1:1' ? `${ratio} (Recommended)` : ratio })) })
-        if ((intent === 'image_edit' || intent === 'video_gen') && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio })) })
-        if (intent === 'video_gen' && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: effectiveVideoModel === 'seedance_2_0' ? [{ label: '5 秒 (Recommended)' }, { label: '8 秒' }, { label: '10 秒' }, { label: '15 秒' }] : [{ label: '5 秒 (Recommended)' }, { label: '3 秒' }, { label: '8 秒' }] })
-        if (intent === 'video_gen' && effectiveVideoModel === 'seedance_2_0' && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: SEEDANCE_RESOLUTIONS.map((resolution) => ({ label: resolution === '720p' ? `${resolution} (Recommended)` : resolution })) })
+        if (intent === 'image_edit' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio })) })
+        if (intent === 'video_gen' && videoCapability && selectedVideoInputMode && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: videoCapability.aspectRatios.map((ratio) => {
+          const label = videoAspectRatioLabel(ratio, selectedVideoInputMode)
+          return { label: ratio === videoCapability.defaultAspectRatio ? `${label} (Recommended)` : label }
+        }) })
+        if (intent === 'video_gen' && videoCapability && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: videoCapability.durations.map((duration) => ({ label: duration === videoCapability.defaultDuration ? `${duration} 秒 (Recommended)` : `${duration} 秒` })) })
+        if (intent === 'video_gen' && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: videoCapability.resolutions.map((resolution) => ({ label: resolution === videoCapability.defaultResolution ? `${resolution} (Recommended)` : resolution })) })
+        if (intent === 'video_gen' && videoCapability?.audioMode === 'optional' && params.generate_audio === undefined) outputQuestions.push({ id: 'generate_audio', header: '生成音频', question: '是否生成视频音频？', options: [{ label: '开启音频 (Recommended)', description: '视频将包含模型生成的音频' }, { label: '关闭音频', description: '生成无音频视频' }] })
         if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({ id: 'n', header: '数量', question: '生成几张？', options: [{ label: '1 张 (Recommended)' }, { label: '2 张' }, { label: '4 张' }] })
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions)
-          if (answers.aspect_ratio) params.aspect_ratio = stripRecommended(selected(answers.aspect_ratio))
+          if (answers.aspect_ratio) params.aspect_ratio = intent === 'video_gen'
+            ? parseVideoAspectRatioLabel(selected(answers.aspect_ratio))
+            : stripRecommended(selected(answers.aspect_ratio))
           if (answers.duration) params.duration = numberLabel(selected(answers.duration))
           if (answers.resolution) params.resolution = stripRecommended(selected(answers.resolution))
+          if (answers.generate_audio) params.generate_audio = stripRecommended(selected(answers.generate_audio)) === '开启音频'
           if (answers.n) params.n = numberLabel(selected(answers.n))
         }
         validateWizardKnown(intent, params, config)
-        const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === 'video_gen' ? Boolean(params.duration) && (effectiveVideoModel !== 'seedance_2_0' || Boolean(params.resolution)) : Boolean(params.n))
+        const videoParametersPresent = videoCapability
+          ? Boolean(params.duration)
+            && (videoCapability.resolutions.length === 1 || Boolean(params.resolution))
+            && (videoCapability.audioMode !== 'optional' || typeof params.generate_audio === 'boolean')
+          : false
+        const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === 'video_gen' ? videoParametersPresent : Boolean(params.n))
         if (!requiredParametersPresent) return result()
         const taskLabel = intent === 'image_edit' ? '图片编辑' : intent === 'video_gen' ? '视频生成' : '图片生成'
         const inputLines = intent === 'image_edit'
@@ -601,9 +692,11 @@ The wizard must complete any remaining confirmation flow before media_generate_i
           `- 任务: ${taskLabel}`, ...inputLines, `- 内容: ${params.prompt}`,
           `- Prompt 来源: ${params.promptSource ?? (promptProvidedBeforeWizard ? 'user' : 'wizard')}`,
           `- Prompt 增强: ${promptWasEnhanced ? '已增强' : '未增强'}`,
-          `- 模型: ${params.model ?? `${defaultModel}（插件默认）`}`, `- 画面比例: ${params.aspect_ratio}`,
+          `- 模型: ${params.model ?? `${defaultModel}（插件默认）`}`,
+          `- 画面比例: ${intent === 'video_gen' && selectedVideoInputMode ? videoAspectRatioLabel(params.aspect_ratio, selectedVideoInputMode) : params.aspect_ratio}`,
           ...(params.duration ? [`- 时长: ${params.duration} 秒`] : []),
-          ...(intent === 'video_gen' ? [`- 分辨率: ${params.resolution ?? '模型工作流默认值'}`] : []),
+          ...(intent === 'video_gen' && videoCapability ? [`- 分辨率: ${params.resolution ?? videoCapability.defaultResolution}`] : []),
+          ...(intent === 'video_gen' && effectiveVideoModel ? [`- 音频: ${videoAudioDescription(effectiveVideoModel, params.generate_audio)}`] : []),
           ...(params.n ? [`- 数量: ${params.n} 张`] : []),
         ]
         if (params.skipFinalConfirmation === true) finalConfirmed = true
@@ -690,6 +783,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
       width: { type: 'integer' },
       height: { type: 'integer' },
       fps: { type: 'integer' },
+      generateAudio: { type: 'boolean' },
       timedOut: { type: 'boolean' },
       error: { type: 'string' },
     },
@@ -702,6 +796,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
       `Generated video (${value.model}, task ${value.taskId})`,
       ...(value.filePath ? [`Saved to: ${value.filePath}`] : []),
       ...(value.url ? [`URL: ${value.url}`] : []),
+      ...(typeof value.generateAudio === 'boolean' ? [`Audio: ${value.generateAudio ? 'enabled' : 'disabled'}`] : []),
       ...(value.error ? [`Local save warning: ${value.error}`] : []),
       ...(value.timedOut ? ['Task is still running. Use media_task_status with this task id.'] : []),
     ]
@@ -711,13 +806,14 @@ The wizard must complete any remaining confirmation flow before media_generate_i
 
   register({
     name: 'media_generate_video',
-    description: 'Generate a short TokensAPI video. Supports text and first/last frame images; image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.',
+    description: 'Generate a short TokensAPI video with model-aware duration, resolution, aspect-ratio, frame-image, and audio validation. Image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.',
     parameters: {
       prompt: { type: 'string', required: true },
       model: { type: 'string', enum: [...VIDEO_MODELS] },
       duration: { type: 'integer', enum: [...DURATIONS] },
       resolution: { type: 'string', enum: [...SEEDANCE_RESOLUTIONS] },
-      aspect_ratio: { type: 'string', enum: [...ASPECT_RATIOS] },
+      aspect_ratio: { type: 'string', enum: [...VIDEO_ASPECT_RATIOS] },
+      generate_audio: { type: 'boolean', description: 'Seedance audio switch. LTX 2.3, LTX 2.5, and MiniMax H3 audio remains enabled.' },
       image_url: { type: 'string', description: 'Legacy first-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL.' },
       reference_images: { type: 'array', items: { type: 'string' }, description: 'Reference image inputs support dsh-attachment selectors, although the current production video contract may reject generic references.' },
       start_image: { type: 'string', description: 'First-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL.' },
@@ -725,14 +821,29 @@ The wizard must complete any remaining confirmation flow before media_generate_i
     },
     output: { schema: videoSchema, render: renderVideo },
     async execute(args: AnyRecord, exec: AnyRecord) {
-      if (args.end_image && !args.start_image) throw new Error('end_image requires start_image')
       const model = args.model ?? config.defaultVideoModel
-      if (args.resolution && model !== 'seedance_2_0') throw new Error('resolution is configurable only for seedance_2_0; ltx_2_3 uses its workflow default.')
-      if (Array.isArray(args.reference_images) && args.reference_images.length > 0) {
-        await Promise.all(args.reference_images.map((input: string) => prepareInput(config, api, input, exec, attachments)))
-        throw new Error('The current TokensAPI production video contract supports first/last frame_images, not generic reference_images.')
-      }
+      const capability = videoModelCapability(model)
       const firstInput = args.start_image ?? args.image_url
+      if (args.end_image && !firstInput) throw new Error('end_image requires start_image or image_url')
+      if (Array.isArray(args.reference_images) && args.reference_images.length > 0) {
+        throw new Error('Version 0.3.3 supports first/last frame_images, not generic reference_images.')
+      }
+      const inputMode = videoInputMode({ ...args, ...(firstInput ? { start_image: firstInput } : {}) })
+      if (!capability.inputModes.includes(inputMode)) throw new Error(`${model} does not support video input mode ${inputMode}.`)
+      const requiredAspectRatio = capability.requiredAspectRatioByInputMode?.[inputMode]
+      const aspectRatio = args.aspect_ratio ?? requiredAspectRatio
+      if (capability.audioMode === 'required' && args.generate_audio === false) {
+        throw new Error(`${model} requires generated audio to remain enabled.`)
+      }
+      const generateAudio = capability.audioMode === 'required'
+        ? true
+        : args.generate_audio ?? capability.defaultAudioEnabled
+      validateWizardKnown('video_gen', {
+        ...args,
+        model,
+        ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+        generate_audio: generateAudio,
+      }, config)
       const startImage = typeof firstInput === 'string' ? await prepareInput(config, api, firstInput, exec, attachments) : undefined
       const endImage = typeof args.end_image === 'string' ? await prepareInput(config, api, args.end_image, exec, attachments) : undefined
       const frameImages = [
@@ -745,7 +856,9 @@ The wizard must complete any remaining confirmation flow before media_generate_i
         n: 1,
         ...(args.duration ? { duration: args.duration } : {}),
         ...(args.resolution ? { resolution: args.resolution } : {}),
-        ...(args.aspect_ratio ? { aspect_ratio: args.aspect_ratio } : {}),
+        ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+        ...(capability.generateAudioParameter === 'required_true' ? { generate_audio: true } : {}),
+        ...(capability.generateAudioParameter === 'optional' ? { generate_audio: generateAudio } : {}),
         ...(frameImages.length ? { frame_images: frameImages } : {}),
       }
       const taskId = await api.submit('videos', body, exec.signal)
@@ -758,6 +871,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
       return {
         taskId,
         model,
+        generateAudio,
         ...saved,
         ...(typeof media.duration_seconds === 'number' ? { durationSeconds: media.duration_seconds } : {}),
         ...(typeof media.width === 'number' ? { width: media.width } : {}),

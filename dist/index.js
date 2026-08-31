@@ -12,11 +12,94 @@ import { readFile, stat } from "node:fs/promises";
 import { extname } from "node:path";
 var IMAGE_MODELS = ["image2", "z_image_turbo", "qwen_image"];
 var IMAGE_EDIT_MODELS = ["image2", "qwen_image"];
-var VIDEO_MODELS = ["ltx_2_3", "seedance_2_0"];
 var IMAGE_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"];
+var LTX_VIDEO_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"];
+var SEEDANCE_2_5_ASPECT_RATIOS = [...LTX_VIDEO_ASPECT_RATIOS, "adaptive"];
+var MINIMAX_H3_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "3:2", "2:3"];
+var VIDEO_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "3:2", "2:3", "adaptive"];
 var DURATIONS = [3, 5, 8, 10, 15];
 var SEEDANCE_RESOLUTIONS = ["480p", "720p", "1080p"];
-var ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"];
+var ASPECT_RATIOS = LTX_VIDEO_ASPECT_RATIOS;
+var VIDEO_MODEL_IDS = [
+  "minimax_h3",
+  "ltx_2_5",
+  "ltx_2_3",
+  "seedance_2_5",
+  "seedance_2_0"
+];
+var VIDEO_MODEL_CAPABILITIES = {
+  ltx_2_3: {
+    durations: [3, 5, 8],
+    resolutions: ["720p"],
+    aspectRatios: LTX_VIDEO_ASPECT_RATIOS,
+    defaultDuration: 5,
+    defaultResolution: "720p",
+    defaultAspectRatio: "16:9",
+    defaultAudioEnabled: true,
+    audioMode: "required",
+    generateAudioParameter: "omit",
+    inputModes: ["text", "first_frame", "first_last_frame"]
+  },
+  seedance_2_0: {
+    durations: [5, 8, 10, 15],
+    resolutions: ["480p", "720p", "1080p"],
+    aspectRatios: LTX_VIDEO_ASPECT_RATIOS,
+    defaultDuration: 5,
+    defaultResolution: "720p",
+    defaultAspectRatio: "16:9",
+    defaultAudioEnabled: true,
+    audioMode: "optional",
+    generateAudioParameter: "optional",
+    inputModes: ["text", "first_frame", "first_last_frame"]
+  },
+  ltx_2_5: {
+    durations: [5, 10],
+    resolutions: ["720p", "1080p"],
+    aspectRatios: LTX_VIDEO_ASPECT_RATIOS,
+    defaultDuration: 5,
+    defaultResolution: "720p",
+    defaultAspectRatio: "16:9",
+    defaultAudioEnabled: true,
+    audioMode: "required",
+    generateAudioParameter: "required_true",
+    inputModes: ["text", "first_frame", "first_last_frame"]
+  },
+  seedance_2_5: {
+    durations: [5, 8, 10, 15],
+    resolutions: ["720p", "1080p"],
+    aspectRatios: SEEDANCE_2_5_ASPECT_RATIOS,
+    defaultDuration: 5,
+    defaultResolution: "720p",
+    defaultAspectRatio: "16:9",
+    defaultAudioEnabled: true,
+    audioMode: "optional",
+    generateAudioParameter: "optional",
+    inputModes: ["text", "first_frame", "first_last_frame"],
+    requiredAspectRatioByInputMode: {
+      first_frame: "adaptive",
+      first_last_frame: "adaptive"
+    }
+  },
+  minimax_h3: {
+    durations: [5, 10],
+    resolutions: ["480p", "720p"],
+    aspectRatios: MINIMAX_H3_ASPECT_RATIOS,
+    defaultDuration: 5,
+    defaultResolution: "720p",
+    defaultAspectRatio: "16:9",
+    defaultAudioEnabled: true,
+    audioMode: "required",
+    generateAudioParameter: "required_true",
+    inputModes: ["text", "first_frame", "first_last_frame"]
+  }
+};
+var VIDEO_MODELS = VIDEO_MODEL_IDS;
+function isVideoModel(value) {
+  return typeof value === "string" && VIDEO_MODEL_IDS.includes(value);
+}
+function videoModelCapability(model) {
+  return VIDEO_MODEL_CAPABILITIES[model];
+}
 var MIME_EXTENSIONS = {
   "image/png": ".png",
   "image/jpeg": ".jpg",
@@ -411,7 +494,7 @@ var Config = Schema.object({
   maxPollMs: Schema.number().default(12 * 60 * 1e3),
   defaultImageModel: Schema.union([...IMAGE_MODELS]).default("z_image_turbo"),
   defaultEditModel: Schema.union([...IMAGE_EDIT_MODELS]).default("qwen_image"),
-  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default("ltx_2_3"),
+  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default("ltx_2_5"),
   enhanceEnabled: Schema.boolean().default(true),
   enhanceApiKeyEnv: Schema.string().role("credential-ref").default("TOKENSAPI_API_KEY"),
   enhanceBaseURL: Schema.string().default("https://tokensapi.ai/v1"),
@@ -641,6 +724,34 @@ function supportedModelsForIntent(intent) {
 function defaultModelForIntent(intent, config) {
   return intent === "video_gen" ? config.defaultVideoModel : intent === "image_edit" ? config.defaultEditModel : config.defaultImageModel;
 }
+function resolveEffectiveVideoModel(params, config) {
+  const model = params.model ?? config.defaultVideoModel;
+  if (!VIDEO_MODELS.includes(model)) throw new Error(`Unsupported video model: ${model}`);
+  return model;
+}
+function videoInputMode(params) {
+  if (params.end_image) return "first_last_frame";
+  if (params.start_image || params.image_url) return "first_frame";
+  return "text";
+}
+function videoAudioDescription(model, generateAudio) {
+  const capability = videoModelCapability(model);
+  if (capability.audioMode === "required") return "\u81EA\u52A8\u751F\u6210\u97F3\u9891\uFF08\u6A21\u578B\u56FA\u5B9A\u5F00\u542F\uFF09";
+  if (capability.audioMode === "not_configurable") return "\u7531\u6A21\u578B\u5DE5\u4F5C\u6D41\u51B3\u5B9A";
+  return generateAudio === false ? "\u5173\u95ED" : "\u5F00\u542F";
+}
+function videoModelDescription(model) {
+  const capability = videoModelCapability(model);
+  const audio = capability.audioMode === "required" ? "\u56FA\u5B9A\u97F3\u9891" : capability.audioMode === "optional" ? "\u97F3\u9891\u53EF\u9009" : "\u97F3\u9891\u4E0D\u53EF\u914D\u7F6E";
+  return `${capability.durations.join("/")} \u79D2 \xB7 ${capability.resolutions.join("/")} \xB7 ${audio}`;
+}
+function videoAspectRatioLabel(ratio, inputMode) {
+  if (ratio !== "adaptive") return ratio;
+  return inputMode === "text" ? "adaptive\uFF08\u6A21\u578B\u81EA\u52A8\u9009\u62E9\u753B\u9762\u6BD4\u4F8B\uFF09" : "adaptive\uFF08\u81EA\u52A8\u5339\u914D\u8F93\u5165\u56FE\u7247\u6BD4\u4F8B\uFF09";
+}
+function parseVideoAspectRatioLabel(value) {
+  return stripRecommended(value).replace(/^adaptive（[^）]+）$/, "adaptive");
+}
 function trimOptionalString(params, key) {
   if (params[key] === void 0) return;
   if (typeof params[key] !== "string") throw new Error(`${key} must be a string.`);
@@ -661,7 +772,7 @@ function normalizeWizardKnown(intent, known, exec) {
   if (params.promptSource !== void 0 && !["user", "inferred", "wizard"].includes(params.promptSource)) {
     throw new Error("promptSource must be user, inferred, or wizard.");
   }
-  for (const key of ["enhanced", "useDefaultModel", "skipFinalConfirmation"]) {
+  for (const key of ["enhanced", "useDefaultModel", "skipFinalConfirmation", "generate_audio"]) {
     if (params[key] !== void 0 && typeof params[key] !== "boolean") throw new Error(`${key} must be a boolean.`);
   }
   for (const key of ["n", "duration"]) {
@@ -681,24 +792,37 @@ function validateWizardKnown(intent, params, config) {
   if (params.model && !supportedModels.includes(params.model)) {
     throw new Error(`Model ${params.model} is not supported for ${intent}. Choose one of: ${supportedModels.join(", ")}.`);
   }
-  const ratios = intent === "image_gen" ? IMAGE_ASPECT_RATIOS : ASPECT_RATIOS;
-  if (params.aspect_ratio && !ratios.includes(params.aspect_ratio)) {
-    throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported for ${intent}. Choose one of: ${ratios.join(", ")}.`);
+  if (intent !== "video_gen") {
+    const ratios = intent === "image_gen" ? IMAGE_ASPECT_RATIOS : ASPECT_RATIOS;
+    if (params.aspect_ratio && !ratios.includes(params.aspect_ratio)) {
+      throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported for ${intent}. Choose one of: ${ratios.join(", ")}.`);
+    }
   }
   if ((intent === "image_gen" || intent === "image_edit") && params.n !== void 0 && ![1, 2, 4].includes(params.n)) {
     throw new Error("Image count n must be 1, 2, or 4.");
   }
   if (intent === "video_gen") {
-    const effectiveModel = params.model ?? defaultModelForIntent(intent, config);
-    const durations = effectiveModel === "seedance_2_0" ? [5, 8, 10, 15] : [3, 5, 8];
-    if (params.duration !== void 0 && !durations.includes(params.duration)) {
-      throw new Error(`Duration ${params.duration} is not supported by ${effectiveModel}. Choose one of: ${durations.join(", ")}.`);
+    const model = resolveEffectiveVideoModel(params, config);
+    const capability = videoModelCapability(model);
+    const inputMode = videoInputMode(params);
+    if (params.aspect_ratio && !capability.aspectRatios.includes(params.aspect_ratio)) {
+      throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported by ${model}. Choose one of: ${capability.aspectRatios.join(", ")}.`);
     }
-    if (params.resolution && effectiveModel !== "seedance_2_0") {
-      throw new Error("resolution is only supported when the effective video model is seedance_2_0.");
+    const requiredAspectRatio = capability.requiredAspectRatioByInputMode?.[inputMode];
+    if (requiredAspectRatio && params.aspect_ratio && params.aspect_ratio !== requiredAspectRatio) {
+      throw new Error(`${model} ${inputMode} requires aspect_ratio=${requiredAspectRatio}.`);
     }
-    if (params.resolution && !SEEDANCE_RESOLUTIONS.includes(params.resolution)) {
-      throw new Error(`Resolution ${params.resolution} is not supported. Choose one of: ${SEEDANCE_RESOLUTIONS.join(", ")}.`);
+    if (params.duration !== void 0 && !capability.durations.includes(params.duration)) {
+      throw new Error(`Duration ${params.duration} is not supported by ${model}. Choose one of: ${capability.durations.join(", ")}.`);
+    }
+    if (params.resolution && !capability.resolutions.includes(params.resolution)) {
+      throw new Error(`Resolution ${params.resolution} is not supported by ${model}. Choose one of: ${capability.resolutions.join(", ")}.`);
+    }
+    if (capability.audioMode === "required" && params.generate_audio === false) {
+      throw new Error(`${model} requires generated audio to remain enabled.`);
+    }
+    if (capability.audioMode === "not_configurable" && params.generate_audio !== void 0) {
+      throw new Error(`${model} does not expose a configurable audio parameter.`);
     }
   }
 }
@@ -795,11 +919,11 @@ function apply(ctx, config) {
     order: 200,
     text: `Before calling media_wizard, first infer the user's media intent and extract every relevant parameter already supplied by the user or current conversation into known. media_wizard is a missing-parameter completer, not a fixed questionnaire: do not ask the user to repeat information already present.
 
-Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". For image editing, when the current or immediately preceding user request contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the user's requested change as prompt. When the user refers to an ordered image, use a 1-based selector such as dsh-attachment:1 or dsh-attachment:2; first, last, and index:N are also supported. Use a full current-conversation attachment id when it is available. If multiple images exist and the target or role is ambiguous, leave the image field absent so the wizard can ask instead of guessing. Extract explicit model, aspect ratio, image count, duration, resolution, input-image roles, and prompt-enhancement preference when stated. Leave genuinely unspecified or ambiguous values absent so the wizard can ask only for those values. Never invent a local path or URL for a chat attachment.
+Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". For image editing, when the current or immediately preceding user request contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the user's requested change as prompt. When the user refers to an ordered image, use a 1-based selector such as dsh-attachment:1 or dsh-attachment:2; first, last, and index:N are also supported. Use a full current-conversation attachment id when it is available. If multiple images exist and the target or role is ambiguous, leave the image field absent so the wizard can ask instead of guessing. Extract explicit model, aspect ratio, image count, duration, resolution, audio-generation preference, input-image roles, and prompt-enhancement preference when stated. Leave genuinely unspecified or ambiguous values absent so the wizard can ask only for those values. Never invent a local path or URL for a chat attachment.
 
-Known-field contract: prompt is the user's requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when the user explicitly chose enhancement behavior; model is present only for an explicit supported model choice; useDefaultModel is true only when the user explicitly chose the plugin default; aspect_ratio, n, duration, resolution, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived. Set skipFinalConfirmation only when the user explicitly asks to proceed without further confirmation; never infer it merely because the request seems complete.
+Known-field contract: prompt is the user's requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when the user explicitly chose enhancement behavior; model is present only for an explicit supported model choice; useDefaultModel is true only when the user explicitly chose the plugin default; aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived. Set skipFinalConfirmation only when the user explicitly asks to proceed without further confirmation; never infer it merely because the request seems complete.
 
-The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.`
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice. For video generation, pass the wizard's generate_audio value to media_generate_video when present.`
   });
   register({
     name: "media_wizard",
@@ -809,7 +933,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
       known: {
         type: "object",
         additionalProperties: true,
-        description: "Parameters already supplied or unambiguously derived from the user request. Supported fields include prompt, promptSource, enhanced, model, useDefaultModel, skipFinalConfirmation, image, aspect_ratio, n, duration, resolution, image_url, start_image, end_image, and reference_images. Do not invent missing values."
+        description: "Parameters already supplied or unambiguously derived from the user request. Supported fields include prompt, promptSource, enhanced, model, useDefaultModel, skipFinalConfirmation, image, aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images. Do not invent missing values."
       }
     },
     output: {
@@ -946,8 +1070,11 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
           modelExplicit = false;
           delete params.model;
         } else {
-          const defaultModelLabel = `${defaultModel}\uFF08\u63D2\u4EF6\u9ED8\u8BA4\uFF0C\u63A8\u8350\uFF09`;
-          const modelOptions = [{ label: defaultModelLabel, description: "\u4F7F\u7528\u63D2\u4EF6\u5F53\u524D\u914D\u7F6E\u7684\u9ED8\u8BA4\u6A21\u578B" }, ...selectableModels.filter((model) => model !== defaultModel).map((model) => ({ label: model }))];
+          const defaultModelLabel = `${defaultModel}\uFF08\u63D2\u4EF6\u9ED8\u8BA4\uFF09`;
+          const modelOptions = selectableModels.map((model) => ({
+            label: model === defaultModel ? defaultModelLabel : model,
+            ...intent === "video_gen" ? { description: `${model === defaultModel ? "\u4F7F\u7528\u63D2\u4EF6\u5F53\u524D\u914D\u7F6E\u7684\u9ED8\u8BA4\u6A21\u578B\uFF1B" : ""}${videoModelDescription(model)}` } : model === defaultModel ? { description: "\u4F7F\u7528\u63D2\u4EF6\u5F53\u524D\u914D\u7F6E\u7684\u9ED8\u8BA4\u6A21\u578B" } : {}
+          }));
           const modelAnswers = await ask(ctx, exec, [{ id: "model", header: "\u6A21\u578B", question: "\u9009\u62E9\u6A21\u578B", options: modelOptions }]);
           const rawModelChoice = selected(modelAnswers.model);
           if (!rawModelChoice) return result();
@@ -963,22 +1090,36 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
             modelExplicit = true;
           }
         }
-        const effectiveVideoModel = intent === "video_gen" ? params.model ?? defaultModel : void 0;
+        const effectiveVideoModel = intent === "video_gen" ? resolveEffectiveVideoModel(params, config) : void 0;
+        const videoCapability = effectiveVideoModel ? videoModelCapability(effectiveVideoModel) : void 0;
+        const selectedVideoInputMode = intent === "video_gen" ? videoInputMode(params) : void 0;
+        if (videoCapability && selectedVideoInputMode) {
+          const requiredAspectRatio = videoCapability.requiredAspectRatioByInputMode?.[selectedVideoInputMode];
+          if (requiredAspectRatio && !params.aspect_ratio) params.aspect_ratio = requiredAspectRatio;
+          if (videoCapability.audioMode === "required" && params.generate_audio === void 0) params.generate_audio = true;
+        }
         const outputQuestions = [];
         if (intent === "image_gen" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === "1:1" ? `${ratio} (Recommended)` : ratio })) });
-        if ((intent === "image_edit" || intent === "video_gen") && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio })) });
-        if (intent === "video_gen" && !params.duration) outputQuestions.push({ id: "duration", header: "\u65F6\u957F", question: "\u9009\u62E9\u89C6\u9891\u65F6\u957F", options: effectiveVideoModel === "seedance_2_0" ? [{ label: "5 \u79D2 (Recommended)" }, { label: "8 \u79D2" }, { label: "10 \u79D2" }, { label: "15 \u79D2" }] : [{ label: "5 \u79D2 (Recommended)" }, { label: "3 \u79D2" }, { label: "8 \u79D2" }] });
-        if (intent === "video_gen" && effectiveVideoModel === "seedance_2_0" && !params.resolution) outputQuestions.push({ id: "resolution", header: "\u5206\u8FA8\u7387", question: "\u9009\u62E9\u89C6\u9891\u5206\u8FA8\u7387", options: SEEDANCE_RESOLUTIONS.map((resolution) => ({ label: resolution === "720p" ? `${resolution} (Recommended)` : resolution })) });
+        if (intent === "image_edit" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio })) });
+        if (intent === "video_gen" && videoCapability && selectedVideoInputMode && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: videoCapability.aspectRatios.map((ratio) => {
+          const label = videoAspectRatioLabel(ratio, selectedVideoInputMode);
+          return { label: ratio === videoCapability.defaultAspectRatio ? `${label} (Recommended)` : label };
+        }) });
+        if (intent === "video_gen" && videoCapability && !params.duration) outputQuestions.push({ id: "duration", header: "\u65F6\u957F", question: "\u9009\u62E9\u89C6\u9891\u65F6\u957F", options: videoCapability.durations.map((duration) => ({ label: duration === videoCapability.defaultDuration ? `${duration} \u79D2 (Recommended)` : `${duration} \u79D2` })) });
+        if (intent === "video_gen" && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: "resolution", header: "\u5206\u8FA8\u7387", question: "\u9009\u62E9\u89C6\u9891\u5206\u8FA8\u7387", options: videoCapability.resolutions.map((resolution) => ({ label: resolution === videoCapability.defaultResolution ? `${resolution} (Recommended)` : resolution })) });
+        if (intent === "video_gen" && videoCapability?.audioMode === "optional" && params.generate_audio === void 0) outputQuestions.push({ id: "generate_audio", header: "\u751F\u6210\u97F3\u9891", question: "\u662F\u5426\u751F\u6210\u89C6\u9891\u97F3\u9891\uFF1F", options: [{ label: "\u5F00\u542F\u97F3\u9891 (Recommended)", description: "\u89C6\u9891\u5C06\u5305\u542B\u6A21\u578B\u751F\u6210\u7684\u97F3\u9891" }, { label: "\u5173\u95ED\u97F3\u9891", description: "\u751F\u6210\u65E0\u97F3\u9891\u89C6\u9891" }] });
         if ((intent === "image_gen" || intent === "image_edit") && !params.n) outputQuestions.push({ id: "n", header: "\u6570\u91CF", question: "\u751F\u6210\u51E0\u5F20\uFF1F", options: [{ label: "1 \u5F20 (Recommended)" }, { label: "2 \u5F20" }, { label: "4 \u5F20" }] });
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions);
-          if (answers.aspect_ratio) params.aspect_ratio = stripRecommended(selected(answers.aspect_ratio));
+          if (answers.aspect_ratio) params.aspect_ratio = intent === "video_gen" ? parseVideoAspectRatioLabel(selected(answers.aspect_ratio)) : stripRecommended(selected(answers.aspect_ratio));
           if (answers.duration) params.duration = numberLabel(selected(answers.duration));
           if (answers.resolution) params.resolution = stripRecommended(selected(answers.resolution));
+          if (answers.generate_audio) params.generate_audio = stripRecommended(selected(answers.generate_audio)) === "\u5F00\u542F\u97F3\u9891";
           if (answers.n) params.n = numberLabel(selected(answers.n));
         }
         validateWizardKnown(intent, params, config);
-        const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === "video_gen" ? Boolean(params.duration) && (effectiveVideoModel !== "seedance_2_0" || Boolean(params.resolution)) : Boolean(params.n));
+        const videoParametersPresent = videoCapability ? Boolean(params.duration) && (videoCapability.resolutions.length === 1 || Boolean(params.resolution)) && (videoCapability.audioMode !== "optional" || typeof params.generate_audio === "boolean") : false;
+        const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === "video_gen" ? videoParametersPresent : Boolean(params.n));
         if (!requiredParametersPresent) return result();
         const taskLabel = intent === "image_edit" ? "\u56FE\u7247\u7F16\u8F91" : intent === "video_gen" ? "\u89C6\u9891\u751F\u6210" : "\u56FE\u7247\u751F\u6210";
         const inputLines = intent === "image_edit" ? [`- \u53C2\u8003\u56FE: ${describeImageInput(params.image)}`] : intent === "video_gen" ? [
@@ -993,9 +1134,10 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
           `- Prompt \u6765\u6E90: ${params.promptSource ?? (promptProvidedBeforeWizard ? "user" : "wizard")}`,
           `- Prompt \u589E\u5F3A: ${promptWasEnhanced ? "\u5DF2\u589E\u5F3A" : "\u672A\u589E\u5F3A"}`,
           `- \u6A21\u578B: ${params.model ?? `${defaultModel}\uFF08\u63D2\u4EF6\u9ED8\u8BA4\uFF09`}`,
-          `- \u753B\u9762\u6BD4\u4F8B: ${params.aspect_ratio}`,
+          `- \u753B\u9762\u6BD4\u4F8B: ${intent === "video_gen" && selectedVideoInputMode ? videoAspectRatioLabel(params.aspect_ratio, selectedVideoInputMode) : params.aspect_ratio}`,
           ...params.duration ? [`- \u65F6\u957F: ${params.duration} \u79D2`] : [],
-          ...intent === "video_gen" ? [`- \u5206\u8FA8\u7387: ${params.resolution ?? "\u6A21\u578B\u5DE5\u4F5C\u6D41\u9ED8\u8BA4\u503C"}`] : [],
+          ...intent === "video_gen" && videoCapability ? [`- \u5206\u8FA8\u7387: ${params.resolution ?? videoCapability.defaultResolution}`] : [],
+          ...intent === "video_gen" && effectiveVideoModel ? [`- \u97F3\u9891: ${videoAudioDescription(effectiveVideoModel, params.generate_audio)}`] : [],
           ...params.n ? [`- \u6570\u91CF: ${params.n} \u5F20`] : []
         ];
         if (params.skipFinalConfirmation === true) finalConfirmed = true;
@@ -1080,6 +1222,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
       width: { type: "integer" },
       height: { type: "integer" },
       fps: { type: "integer" },
+      generateAudio: { type: "boolean" },
       timedOut: { type: "boolean" },
       error: { type: "string" }
     }
@@ -1091,6 +1234,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
       `Generated video (${value.model}, task ${value.taskId})`,
       ...value.filePath ? [`Saved to: ${value.filePath}`] : [],
       ...value.url ? [`URL: ${value.url}`] : [],
+      ...typeof value.generateAudio === "boolean" ? [`Audio: ${value.generateAudio ? "enabled" : "disabled"}`] : [],
       ...value.error ? [`Local save warning: ${value.error}`] : [],
       ...value.timedOut ? ["Task is still running. Use media_task_status with this task id."] : []
     ];
@@ -1099,13 +1243,14 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
   };
   register({
     name: "media_generate_video",
-    description: "Generate a short TokensAPI video. Supports text and first/last frame images; image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.",
+    description: "Generate a short TokensAPI video with model-aware duration, resolution, aspect-ratio, frame-image, and audio validation. Image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.",
     parameters: {
       prompt: { type: "string", required: true },
       model: { type: "string", enum: [...VIDEO_MODELS] },
       duration: { type: "integer", enum: [...DURATIONS] },
       resolution: { type: "string", enum: [...SEEDANCE_RESOLUTIONS] },
-      aspect_ratio: { type: "string", enum: [...ASPECT_RATIOS] },
+      aspect_ratio: { type: "string", enum: [...VIDEO_ASPECT_RATIOS] },
+      generate_audio: { type: "boolean", description: "Seedance audio switch. LTX 2.3, LTX 2.5, and MiniMax H3 audio remains enabled." },
       image_url: { type: "string", description: "Legacy first-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." },
       reference_images: { type: "array", items: { type: "string" }, description: "Reference image inputs support dsh-attachment selectors, although the current production video contract may reject generic references." },
       start_image: { type: "string", description: "First-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." },
@@ -1113,14 +1258,27 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
     },
     output: { schema: videoSchema, render: renderVideo },
     async execute(args, exec) {
-      if (args.end_image && !args.start_image) throw new Error("end_image requires start_image");
       const model = args.model ?? config.defaultVideoModel;
-      if (args.resolution && model !== "seedance_2_0") throw new Error("resolution is configurable only for seedance_2_0; ltx_2_3 uses its workflow default.");
-      if (Array.isArray(args.reference_images) && args.reference_images.length > 0) {
-        await Promise.all(args.reference_images.map((input) => prepareInput(config, api, input, exec, attachments)));
-        throw new Error("The current TokensAPI production video contract supports first/last frame_images, not generic reference_images.");
-      }
+      const capability = videoModelCapability(model);
       const firstInput = args.start_image ?? args.image_url;
+      if (args.end_image && !firstInput) throw new Error("end_image requires start_image or image_url");
+      if (Array.isArray(args.reference_images) && args.reference_images.length > 0) {
+        throw new Error("Version 0.3.3 supports first/last frame_images, not generic reference_images.");
+      }
+      const inputMode = videoInputMode({ ...args, ...firstInput ? { start_image: firstInput } : {} });
+      if (!capability.inputModes.includes(inputMode)) throw new Error(`${model} does not support video input mode ${inputMode}.`);
+      const requiredAspectRatio = capability.requiredAspectRatioByInputMode?.[inputMode];
+      const aspectRatio = args.aspect_ratio ?? requiredAspectRatio;
+      if (capability.audioMode === "required" && args.generate_audio === false) {
+        throw new Error(`${model} requires generated audio to remain enabled.`);
+      }
+      const generateAudio = capability.audioMode === "required" ? true : args.generate_audio ?? capability.defaultAudioEnabled;
+      validateWizardKnown("video_gen", {
+        ...args,
+        model,
+        ...aspectRatio ? { aspect_ratio: aspectRatio } : {},
+        generate_audio: generateAudio
+      }, config);
       const startImage = typeof firstInput === "string" ? await prepareInput(config, api, firstInput, exec, attachments) : void 0;
       const endImage = typeof args.end_image === "string" ? await prepareInput(config, api, args.end_image, exec, attachments) : void 0;
       const frameImages = [
@@ -1133,7 +1291,9 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
         n: 1,
         ...args.duration ? { duration: args.duration } : {},
         ...args.resolution ? { resolution: args.resolution } : {},
-        ...args.aspect_ratio ? { aspect_ratio: args.aspect_ratio } : {},
+        ...aspectRatio ? { aspect_ratio: aspectRatio } : {},
+        ...capability.generateAudioParameter === "required_true" ? { generate_audio: true } : {},
+        ...capability.generateAudioParameter === "optional" ? { generate_audio: generateAudio } : {},
         ...frameImages.length ? { frame_images: frameImages } : {}
       };
       const taskId = await api.submit("videos", body, exec.signal);
@@ -1146,6 +1306,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt (Re
       return {
         taskId,
         model,
+        generateAudio,
         ...saved,
         ...typeof media.duration_seconds === "number" ? { durationSeconds: media.duration_seconds } : {},
         ...typeof media.width === "number" ? { width: media.width } : {},
@@ -1230,8 +1391,13 @@ Video models: ${value.videos.join(", ")}` }]
 export {
   Config,
   TokensApiClient,
+  VIDEO_MODELS,
+  VIDEO_MODEL_CAPABILITIES,
+  VIDEO_MODEL_IDS,
   apply,
   inject,
-  name
+  isVideoModel,
+  name,
+  videoModelCapability
 };
 //# sourceMappingURL=index.js.map

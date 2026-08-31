@@ -27,6 +27,18 @@ Other DSH versions are not yet guaranteed.
 - TokensAPI presigned or configurable R2/S3 reference-image upload;
 - Prompt enhancement enabled by default through TokensAPI (`deepseek-v4-flash`).
 
+## Video models
+
+| Model | Durations | Resolutions | Generated audio |
+| --- | --- | --- | --- |
+| `ltx_2_3` | 3, 5, 8 seconds | `720p` | Always enabled by the workflow |
+| `seedance_2_0` | 5, 8, 10, 15 seconds | `480p`, `720p`, `1080p` | Optional; enabled by default |
+| `ltx_2_5` | 5, 10 seconds | `720p`, `1080p` | Required and cannot be disabled |
+| `seedance_2_5` | 5, 8, 10, 15 seconds | `720p`, `1080p` | Optional; enabled by default |
+| `minimax_h3` | 5, 10 seconds | `480p`, `720p` | Required and cannot be disabled |
+
+LTX 2.5 does not support `1440p` in this plugin. Seedance 2.5 first-frame and first/last-frame tasks use `adaptive`: the plugin explains it as automatically matching the input image ratio. For text-to-video, the `adaptive` option means the model chooses the output aspect ratio.
+
 ## Privacy
 
 TokensAPI production task endpoints require publicly accessible HTTPS reference images. The plugin never uploads local images to third-party temporary hosts such as uguu.se or tmpfiles.org.
@@ -59,7 +71,9 @@ Videos are saved to:
 <home>/Downloads/dsh-media-gen
 ```
 
-Default models are configurable. When the user does not explicitly choose a model, tool calls should omit the model field and let the plugin default apply.
+Default models are configurable. The default video model is `ltx_2_5`. Video choices keep the fixed order `minimax_h3`, `ltx_2_5`, `ltx_2_3`, `seedance_2_5`, `seedance_2_0`; the default is labeled without a recommendation badge. When the user does not explicitly choose a model, tool calls should omit the model field and let the plugin default apply.
+
+Video wizard choices are driven by the selected model capability. Fixed-audio models show the audio status without a switch. Seedance models ask whether to generate audio and default to enabled. The final confirmation includes the selected model, frame inputs, duration, resolution, aspect ratio, and audio status.
 
 ## Development
 

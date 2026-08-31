@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.3
+
+- Added `ltx_2_5`, `seedance_2_5`, and `minimax_h3` to the video model catalog while retaining `ltx_2_3` and `seedance_2_0`.
+- Added a shared video capability matrix for model-specific durations, resolutions, aspect ratios, frame-input modes, and generated-audio behavior.
+- Added dynamic wizard choices and validation for all five video models, including explanatory `adaptive` labels for Seedance 2.5.
+- Marked LTX 2.3, LTX 2.5, and MiniMax H3 audio as fixed on; Seedance 2.0 and Seedance 2.5 expose an audio switch that defaults to enabled.
+- Added model-aware request construction: LTX 2.3 omits the audio parameter, LTX 2.5 and MiniMax H3 send `generate_audio: true`, and Seedance forwards the selected boolean.
+- Restricted LTX 2.5 to `720p` and `1080p`; `1440p` is not exposed or accepted by the plugin.
+- Added pre-submission validation for invalid durations, resolutions, aspect ratios, frame combinations, and attempts to disable required audio.
+- Added capability, wizard, request-body, `adaptive`-label, and regression tests without making paid production generation calls.
+- Set `ltx_2_5` as the default video model while keeping the fixed display order `minimax_h3`, `ltx_2_5`, `ltx_2_3`, `seedance_2_5`, `seedance_2_0`.
+- Removed the recommendation badge from the video model list; the default model now uses a plain `（插件默认）` label.
+
 ## 0.3.2
 
 - Added a compact in-image download icon to generated and edited image result cards.

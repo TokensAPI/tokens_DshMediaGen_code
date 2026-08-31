@@ -25,6 +25,18 @@
 - 引导式媒体参数向导；
 - 可选提示词增强。
 
+## 视频模型
+
+| 模型 | 时长 | 分辨率 | 生成音频 |
+| --- | --- | --- | --- |
+| `ltx_2_3` | 3、5、8 秒 | `720p` | 工作流固定开启 |
+| `seedance_2_0` | 5、8、10、15 秒 | `480p`、`720p`、`1080p` | 可选，默认开启 |
+| `ltx_2_5` | 5、10 秒 | `720p`、`1080p` | 强制开启，不能关闭 |
+| `seedance_2_5` | 5、8、10、15 秒 | `720p`、`1080p` | 可选，默认开启 |
+| `minimax_h3` | 5、10 秒 | `480p`、`720p` | 强制开启，不能关闭 |
+
+LTX 2.5 不支持 `1440p`，插件不会显示或提交该分辨率。Seedance 2.5 使用首帧或首尾帧时，画面比例自动设为 `adaptive（自动匹配输入图片比例）`；纯文生视频的比例选项显示为 `adaptive（模型自动选择画面比例）`。
+
 ## 隐私
 
 TokensAPI 生产任务接口要求参考图片是公开可访问的 HTTPS URL。插件不会把本地图片上传到 `uguu.se`、`tmpfiles.org` 或其他第三方临时图床。
@@ -95,7 +107,7 @@ pnpm add ~/Downloads/tokens-dsh-media-gen-<版本号>.tgz
       config:
         defaultImageModel: z_image_turbo
         defaultEditModel: qwen_image
-        defaultVideoModel: ltx_2_3
+        defaultVideoModel: ltx_2_5
         enhanceEnabled: true
 ```
 
@@ -119,7 +131,7 @@ pnpm add ~/Downloads/tokens-dsh-media-gen-<版本号>.tgz
 - `image2`
 - `qwen_image`
 
-图片编辑应显示 `qwen_image（插件默认，推荐）` 和 `image2`；视频应显示 `ltx_2_3（插件默认，推荐）` 和 `seedance_2_0`。选择带“插件默认”标记的选项时，工具调用不会显式传入 `model`，而是由插件当前配置决定模型。
+图片编辑应显示 `qwen_image（插件默认，推荐）` 和 `image2`；视频模型固定显示为 `minimax_h3`、`ltx_2_5（插件默认）`、`ltx_2_3`、`seedance_2_5`、`seedance_2_0`。视频模型不再显示绿色“推荐”标记，默认模型是 `ltx_2_5`，但不会被强制移到列表首位。选择带“插件默认”标记的选项时，工具调用不会显式传入 `model`，而是由插件当前配置决定模型。
 
 ### 常见安装问题
 
@@ -180,7 +192,7 @@ pollIntervalMs: 5000
 maxPollMs: 720000
 defaultImageModel: z_image_turbo
 defaultEditModel: qwen_image
-defaultVideoModel: ltx_2_3
+defaultVideoModel: ltx_2_5
 enhanceEnabled: true
 enhanceApiKeyEnv: TOKENSAPI_API_KEY
 enhanceBaseURL: https://tokensapi.ai/v1
@@ -220,7 +232,7 @@ r2PathPrefix: inputs
 
 图片生成只展示 TokensAPI 支持的画面比例，不显示像素分辨率：`1:1`、`16:9`、`9:16`、`4:3`、`3:4`、`3:2`、`2:3`。
 
-视频输出参数根据所选模型动态显示：`ltx_2_3` 支持 3/5/8 秒并使用工作流默认分辨率；`seedance_2_0` 支持 5/8/10/15 秒，并提供 `480p`、`720p`、`1080p` 可点击分辨率选项（默认 `720p`）。用户已经给出纯文本视频 Prompt 且没有图片输入时，向导直接推断为纯文生视频，不再额外询问视频类型。最终摘要会列出任务类型、图片输入、Prompt 来源和增强状态、模型与完整输出参数；`skipFinalConfirmation` 只应在用户明确要求直接执行时使用。
+视频输出参数根据所选模型能力动态显示，包括画面比例、时长、分辨率和音频状态。`ltx_2_3`、`ltx_2_5` 和 `minimax_h3` 固定生成音频，不提供关闭选项；`seedance_2_0` 和 `seedance_2_5` 提供音频开关并默认开启。Seedance 2.5 的首帧和首尾帧任务自动使用 `adaptive`。用户已经给出纯文本视频 Prompt 且没有图片输入时，向导直接推断为纯文生视频，不再额外询问视频类型。最终摘要会列出任务类型、图片输入、Prompt 来源和增强状态、模型、完整输出参数与音频状态；`skipFinalConfirmation` 只应在用户明确要求直接执行时使用。
 
 任一步取消或缺少确认时，向导不会完成，也不会创建生成任务。
 
