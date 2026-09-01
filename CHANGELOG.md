@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.4
+
+- Added an explicit context-reuse consent gate for prior Prompt, reference images or frame inputs, and generation settings.
+- Separated current-request parameters from historical same-intent task candidates so new media tasks no longer silently inherit previous values.
+- Added per-category explicit reuse/reset decisions, current-request precedence, compatibility filtering, and reuse-source summaries.
+- Replaced the UI-triggering English recommendation suffix with plain `（推荐）` text across wizard choices, and renamed default-model labels from `（插件默认）` to `（推荐）`.
+- Added the complete current Prompt and its source to the Prompt-enhancement question before the user chooses whether to enhance it.
+- Reused one idempotency key for every retry of the same in-process media submission, including repeated tool calls whose uploaded reference URLs changed.
+- Adopted task IDs returned by HTTP 429 responses, respected `Retry-After`, and prevented known or uncertain submissions from silently creating a new task.
+- Added transient status-poll recovery with bounded backoff for network failures, HTTP 408/425/429, and server errors; unchanged progress no longer implies failure.
+- Preserved the task ID, last status, and progress when foreground polling times out so the existing `media_task_status` tool can recover the result without resubmission.
+- Added network-failure, idempotency, 429, stalled-progress, timeout, and non-retryable-error regression tests without making paid production calls.
+
 ## 0.3.3
 
 - Added `ltx_2_5`, `seedance_2_5`, and `minimax_h3` to the video model catalog while retaining `ltx_2_3` and `seedance_2_0`.

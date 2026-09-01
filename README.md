@@ -75,6 +75,10 @@ Default models are configurable. The default video model is `ltx_2_5`. Video cho
 
 Video wizard choices are driven by the selected model capability. Fixed-audio models show the audio status without a switch. Seedance models ask whether to generate audio and default to enabled. The final confirmation includes the selected model, frame inputs, duration, resolution, aspect ratio, and audio status.
 
+Starting with `0.3.4`, current-request values are separated from reusable values found in the most recent same-intent task. Ambiguous follow-ups ask independently before reusing the prior Prompt, reference images or frame inputs, and generation settings. Explicit current-request values always win, and historical media is never selected silently.
+
+Media submissions in `0.3.4` retain one in-process idempotency operation while the request is uncertain or its task is still running. Network failures and HTTP 429 responses therefore retry only with the same idempotency key; a returned `task_id` switches permanently to status polling. Transient polling failures use bounded backoff, unchanged progress remains a running state, and foreground timeouts return the task ID for `media_task_status` recovery instead of authorizing another submission.
+
 ## Development
 
 ```bash
@@ -91,3 +95,4 @@ pnpm run pack:dry
 - DSH `rc.8` has no video attachment type. The plugin therefore serves saved MP4 files through a restricted same-origin `/media-gen/videos/` route with byte-range support; remote TokensAPI URLs remain the fallback.
 - Public generation task endpoints do not directly accept Data URLs. Local images are converted and sent through TokensAPI presigned object storage before task submission.
 - The current production presign route uses account authentication; an `sk-...` API key alone is rejected until the server enables `TokenOrUserAuth`.
+- Submission recovery state is currently process-local and is not written to a task journal. Restarting DSH/TokensCowork clears uncertain submissions that never returned a `task_id`; known task IDs remain recoverable when retained in conversation history.

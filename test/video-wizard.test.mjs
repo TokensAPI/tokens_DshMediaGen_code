@@ -58,6 +58,211 @@ function execContext() {
   return { signal: new AbortController().signal }
 }
 
+test('prompt enhancement question shows the complete current prompt and its source', async () => {
+  let enhanceQuestion
+  const { tools } = await createHarness((questions) => {
+    const question = questions.find((item) => item.id === 'enhance')
+    if (question) {
+      enhanceQuestion = question
+      return { answers: [{ id: 'enhance', selected: ['保持原始 Prompt'] }] }
+    }
+    return { answers: [] }
+  })
+  const wizard = tools.get('media_wizard')
+  const prompt = 'A complete prompt\nwith an intentional second line.'
+
+  await wizard.execute({
+    intent: 'video_gen',
+    known: { prompt, promptSource: 'user' },
+  }, execContext())
+
+  assert.equal(enhanceQuestion.question, '是否增强下面的 Prompt？')
+  assert.equal(enhanceQuestion.detail, `当前 Prompt\n来源：本次输入\n\n${prompt}`)
+})
+
+test('prompt entered in the wizard is labeled as wizard input before enhancement', async () => {
+  let enhanceDetail = ''
+  const { tools } = await createHarness((questions) => {
+    const promptQuestion = questions.find((question) => question.id === 'prompt')
+    if (promptQuestion) return { answers: [{ id: 'prompt', custom: 'Prompt entered inside the wizard' }] }
+    const enhanceQuestion = questions.find((question) => question.id === 'enhance')
+    if (enhanceQuestion) {
+      enhanceDetail = enhanceQuestion.detail
+      return { answers: [{ id: 'enhance', selected: ['保持原始 Prompt'] }] }
+    }
+    return { answers: [] }
+  })
+  const wizard = tools.get('media_wizard')
+
+  await wizard.execute({ intent: 'image_gen', known: {} }, execContext())
+
+  assert.equal(enhanceDetail, '当前 Prompt\n来源：向导中填写\n\nPrompt entered inside the wizard')
+})
+
+test('enhanced prompt comparison preserves the exact original prompt', async () => {
+  let comparisonDetail = ''
+  const { mod, tools } = await createHarness((questions) => {
+    const enhanceQuestion = questions.find((question) => question.id === 'enhance')
+    if (enhanceQuestion) return { answers: [{ id: 'enhance', selected: ['增强 Prompt（推荐）'] }] }
+    const confirmQuestion = questions.find((question) => question.id === 'prompt_confirm')
+    if (confirmQuestion) {
+      comparisonDetail = confirmQuestion.detail
+      return { answers: [{ id: 'prompt_confirm', selected: ['确认增强后 Prompt（推荐）'] }] }
+    }
+    return { answers: [] }
+  })
+  const wizard = tools.get('media_wizard')
+  const originalEnhance = mod.TokensApiClient.prototype.enhance
+  const originalPrompt = 'Original prompt\nwith preserved formatting.'
+  mod.TokensApiClient.prototype.enhance = async function () { return 'Enhanced prompt result.' }
+
+  try {
+    await wizard.execute({
+      intent: 'image_gen',
+      known: { prompt: originalPrompt, promptSource: 'inferred' },
+    }, execContext())
+  } finally {
+    mod.TokensApiClient.prototype.enhance = originalEnhance
+  }
+
+  assert.equal(comparisonDetail, `原始 Prompt:\n${originalPrompt}\n\n增强后 Prompt:\nEnhanced prompt result.`)
+})
+
+test('ambiguous follow-up asks before reusing prior prompt, references, and settings', async () => {
+  const { tools, questionCalls } = await createHarness((questions) => {
+    const reuseQuestions = questions.filter((question) => question.id.startsWith('reuse_'))
+    if (reuseQuestions.length) {
+      return {
+        answers: reuseQuestions.map((question) => ({ id: question.id, selected: ['不复用'] })),
+      }
+    }
+    return { answers: [] }
+  })
+  const wizard = tools.get('media_wizard')
+
+  const result = await wizard.execute({
+    intent: 'video_gen',
+    known: {},
+    previousTask: {
+      intent: 'video_gen',
+      params: {
+        prompt: 'A previous neon city video',
+        start_image: 'https://example.com/previous-start.png',
+        end_image: 'https://example.com/previous-end.png',
+        model: 'ltx_2_5',
+        duration: 5,
+        resolution: '720p',
+        aspect_ratio: '16:9',
+        generate_audio: true,
+      },
+    },
+  }, execContext())
+
+  const reuseCall = questionCalls.find((questions) => questions.some((question) => question.id === 'reuse_prompt'))
+  assert.ok(reuseCall)
+  assert.deepEqual(reuseCall.map((question) => question.id), ['reuse_prompt', 'reuse_references', 'reuse_settings'])
+  assert.deepEqual(reuseCall[0].options.map((option) => option.label), ['不复用', '复用'])
+  assert.equal(result.reuseDecisions.prompt, false)
+  assert.equal(result.reuseDecisions.references, false)
+  assert.equal(result.reuseDecisions.settings, false)
+  assert.equal(result.params.prompt, undefined)
+  assert.equal(result.params.start_image, undefined)
+  assert.equal(result.params.model, undefined)
+})
+
+test('confirmed reuse merges prior values and marks the prompt source as reused', async () => {
+  let finalDetail = ''
+  let enhanceDetail = ''
+  const { tools, questionCalls } = await createHarness((questions) => {
+    const reuseQuestions = questions.filter((question) => question.id.startsWith('reuse_'))
+    if (reuseQuestions.length) {
+      return {
+        answers: reuseQuestions.map((question) => ({ id: question.id, selected: ['复用'] })),
+      }
+    }
+    const enhanceQuestion = questions.find((question) => question.id === 'enhance')
+    if (enhanceQuestion) {
+      enhanceDetail = enhanceQuestion.detail
+      return { answers: [{ id: 'enhance', selected: ['保持原始 Prompt'] }] }
+    }
+    const finalQuestion = questions.find((question) => question.id === 'final_confirm')
+    if (finalQuestion) {
+      finalDetail = finalQuestion.detail
+      return { answers: [{ id: 'final_confirm', selected: ['确认生成（推荐）'] }] }
+    }
+    return { answers: [] }
+  })
+  const wizard = tools.get('media_wizard')
+
+  const result = await wizard.execute({
+    intent: 'video_gen',
+    known: {},
+    previousTask: {
+      intent: 'video_gen',
+      params: {
+        prompt: 'A previous neon city video',
+        start_image: 'https://example.com/previous-start.png',
+        end_image: 'https://example.com/previous-end.png',
+        model: 'ltx_2_5',
+        duration: 5,
+        resolution: '720p',
+        aspect_ratio: '16:9',
+        generate_audio: true,
+      },
+    },
+  }, execContext())
+
+  assert.equal(result.confirmed, true)
+  assert.equal(result.params.prompt, 'A previous neon city video')
+  assert.equal(result.params.promptSource, 'reused')
+  assert.equal(result.params.enhanced, false)
+  assert.equal(result.params.start_image, 'https://example.com/previous-start.png')
+  assert.equal(result.params.end_image, 'https://example.com/previous-end.png')
+  assert.equal(result.params.model, 'ltx_2_5')
+  assert.equal(result.params.duration, 5)
+  assert.equal(result.params.resolution, '720p')
+  assert.match(finalDetail, /Prompt 来源: reused/)
+  assert.equal(enhanceDetail, '当前 Prompt\n来源：历史任务复用\n\nA previous neon city video')
+  assert.equal(questionCalls.flat().filter((question) => question.id.startsWith('reuse_')).length, 3)
+  assert.equal(questionCalls.flat().some((question) => question.id === 'enhance'), true)
+})
+
+test('current request values win and explicit reuse decisions skip the consent questions', async () => {
+  const { tools, questionCalls } = await createHarness()
+  const wizard = tools.get('media_wizard')
+
+  const result = await wizard.execute({
+    intent: 'video_gen',
+    known: {
+      prompt: 'A completely new forest scene',
+      promptSource: 'user',
+      enhanced: false,
+      skipFinalConfirmation: true,
+    },
+    previousTask: {
+      intent: 'video_gen',
+      params: {
+        prompt: 'The old city scene must not return',
+        start_image: 'https://example.com/old-start.png',
+        model: 'ltx_2_5',
+        duration: 5,
+        resolution: '720p',
+        aspect_ratio: '16:9',
+        generate_audio: true,
+      },
+    },
+    reuse: { prompt: true, references: false, settings: true },
+  }, execContext())
+
+  assert.equal(result.confirmed, true)
+  assert.equal(result.params.prompt, 'A completely new forest scene')
+  assert.equal(result.params.promptSource, 'user')
+  assert.equal(result.params.start_image, undefined)
+  assert.equal(result.params.model, 'ltx_2_5')
+  assert.equal(result.params.duration, 5)
+  assert.equal(questionCalls.flat().some((question) => question.id.startsWith('reuse_')), false)
+})
+
 test('video wizard model selection exposes all 0.3.3 models with capability descriptions', async () => {
   const { tools, questionCalls } = await createHarness()
   const wizard = tools.get('media_wizard')
@@ -72,12 +277,12 @@ test('video wizard model selection exposes all 0.3.3 models with capability desc
   assert.ok(modelQuestion)
   assert.deepEqual(modelQuestion.options.map((option) => option.label), [
     'minimax_h3',
-    'ltx_2_5（插件默认）',
+    'ltx_2_5（推荐）',
     'ltx_2_3',
     'seedance_2_5',
     'seedance_2_0',
   ])
-  const ltx25 = modelQuestion.options.find((option) => option.label === 'ltx_2_5（插件默认）')
+  const ltx25 = modelQuestion.options.find((option) => option.label === 'ltx_2_5（推荐）')
   assert.match(ltx25.description, /5\/10 秒/)
   assert.match(ltx25.description, /720p\/1080p/)
   assert.doesNotMatch(ltx25.description, /1440p/)
@@ -91,7 +296,7 @@ test('seedance 2.5 first-frame wizard enforces adaptive ratio and allows disabli
     const finalQuestion = questions.find((question) => question.id === 'final_confirm')
     if (finalQuestion) {
       finalDetail = finalQuestion.detail
-      return { answers: [{ id: 'final_confirm', selected: ['确认生成 (Recommended)'] }] }
+      return { answers: [{ id: 'final_confirm', selected: ['确认生成（推荐）'] }] }
     }
     return { answers: [] }
   })
@@ -114,7 +319,7 @@ test('seedance 2.5 first-frame wizard enforces adaptive ratio and allows disabli
   assert.equal(result.params.generate_audio, false)
   const audioQuestion = questionCalls.flat().find((question) => question.id === 'generate_audio')
   assert.deepEqual(audioQuestion.options.map((option) => option.label), [
-    '开启音频 (Recommended)',
+    '开启音频（推荐）',
     '关闭音频',
   ])
   assert.match(finalDetail, /- 画面比例: adaptive（自动匹配输入图片比例）/)
@@ -166,7 +371,7 @@ test('video wizard final confirmation summarizes fixed generated audio', async (
     const finalQuestion = questions.find((question) => question.id === 'final_confirm')
     if (!finalQuestion) return { answers: [] }
     finalDetail = finalQuestion.detail
-    return { answers: [{ id: 'final_confirm', selected: ['确认生成 (Recommended)'] }] }
+    return { answers: [{ id: 'final_confirm', selected: ['确认生成（推荐）'] }] }
   })
   const wizard = tools.get('media_wizard')
 

@@ -71,6 +71,8 @@ export const Config = Schema.object({
 })
 
 type AnyRecord = Record<string, any>
+type MediaIntent = 'image_gen' | 'image_edit' | 'video_gen'
+type ReuseCategory = 'prompt' | 'references' | 'settings'
 
 const VIDEO_ROUTE_PREFIX = '/media-gen/videos'
 const DOWNLOAD_ROUTE = '/media-gen/download'
@@ -313,6 +315,115 @@ function parseVideoAspectRatioLabel(value: unknown): string {
   return stripRecommended(value).replace(/^adaptive（[^）]+）$/, 'adaptive')
 }
 
+const REFERENCE_REUSE_KEYS: Record<MediaIntent, readonly string[]> = {
+  image_gen: [],
+  image_edit: ['image'],
+  video_gen: ['image_url', 'start_image', 'end_image'],
+}
+
+const SETTINGS_REUSE_KEYS: Record<MediaIntent, readonly string[]> = {
+  image_gen: ['model', 'useDefaultModel', 'aspect_ratio', 'n'],
+  image_edit: ['model', 'useDefaultModel', 'aspect_ratio', 'n'],
+  video_gen: ['model', 'useDefaultModel', 'aspect_ratio', 'duration', 'resolution', 'generate_audio'],
+}
+
+function normalizeReuseDecisions(value: unknown): Partial<Record<ReuseCategory, boolean>> {
+  if (value === undefined) return {}
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('reuse must be an object.')
+  const decisions: Partial<Record<ReuseCategory, boolean>> = {}
+  for (const category of ['prompt', 'references', 'settings'] as const) {
+    const decision = (value as AnyRecord)[category]
+    if (decision !== undefined && typeof decision !== 'boolean') throw new Error(`reuse.${category} must be a boolean.`)
+    if (typeof decision === 'boolean') decisions[category] = decision
+  }
+  return decisions
+}
+
+function normalizeContextCandidates(intent: MediaIntent, value: unknown): AnyRecord {
+  if (value === undefined) return {}
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('previousTask must be an object.')
+  const previous = value as AnyRecord
+  if (previous.intent !== intent) return {}
+  if (previous.params === null || typeof previous.params !== 'object' || Array.isArray(previous.params)) {
+    throw new Error('previousTask.params must be an object.')
+  }
+  const source = previous.params as AnyRecord
+  const keys = ['prompt', ...REFERENCE_REUSE_KEYS[intent], ...SETTINGS_REUSE_KEYS[intent]]
+  const candidates: AnyRecord = {}
+  for (const key of keys) {
+    if (source[key] !== undefined) candidates[key] = source[key]
+  }
+  for (const key of ['prompt', 'model', 'image', 'aspect_ratio', 'resolution', 'image_url', 'start_image', 'end_image']) {
+    trimOptionalString(candidates, key)
+  }
+  for (const key of ['useDefaultModel', 'generate_audio']) {
+    if (candidates[key] !== undefined && typeof candidates[key] !== 'boolean') delete candidates[key]
+  }
+  for (const key of ['n', 'duration']) {
+    if (candidates[key] !== undefined && (!Number.isInteger(candidates[key]) || candidates[key] <= 0)) delete candidates[key]
+  }
+  if (candidates.model && candidates.useDefaultModel === true) delete candidates.useDefaultModel
+  return candidates
+}
+
+function missingReusableValues(params: AnyRecord, candidates: AnyRecord, keys: readonly string[]): AnyRecord {
+  return Object.fromEntries(keys
+    .filter((key) => params[key] === undefined && candidates[key] !== undefined)
+    .map((key) => [key, candidates[key]]))
+}
+
+function truncatedPrompt(value: unknown): string {
+  const prompt = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return prompt.length > 180 ? `${prompt.slice(0, 177)}...` : prompt
+}
+
+function promptSourceDescription(value: unknown): string {
+  if (value === 'inferred') return '根据当前请求推断'
+  if (value === 'wizard') return '向导中填写'
+  if (value === 'reused') return '历史任务复用'
+  return '本次输入'
+}
+
+function reusableReferenceDetail(intent: MediaIntent, values: AnyRecord): string {
+  if (intent === 'image_edit') return `参考图：${describeImageInput(values.image)}`
+  return [
+    ...(values.start_image || values.image_url ? [`首帧：${describeImageInput(values.start_image ?? values.image_url)}`] : []),
+    ...(values.end_image ? [`尾帧：${describeImageInput(values.end_image)}`] : []),
+  ].join('\n')
+}
+
+function reusableSettingsDetail(values: AnyRecord): string {
+  return [
+    ...(values.model ? [`模型：${values.model}`] : values.useDefaultModel === true ? ['模型：推荐模型'] : []),
+    ...(values.aspect_ratio ? [`画面比例：${values.aspect_ratio}`] : []),
+    ...(values.n ? [`数量：${values.n} 张`] : []),
+    ...(values.duration ? [`时长：${values.duration} 秒`] : []),
+    ...(values.resolution ? [`分辨率：${values.resolution}`] : []),
+    ...(typeof values.generate_audio === 'boolean' ? [`音频：${values.generate_audio ? '开启' : '关闭'}`] : []),
+  ].join('\n')
+}
+
+function mergeReusableValues(params: AnyRecord, values: AnyRecord): void {
+  for (const [key, value] of Object.entries(values)) {
+    if (params[key] === undefined) params[key] = value
+  }
+}
+
+function pruneIncompatibleReusedSettings(intent: MediaIntent, params: AnyRecord, reusedKeys: Set<string>, config: MediaConfig): void {
+  const supportedModels = supportedModelsForIntent(intent)
+  if (reusedKeys.has('model') && params.model && !supportedModels.includes(params.model)) delete params.model
+  if (intent === 'video_gen') {
+    const model = resolveEffectiveVideoModel(params, config)
+    const capability = videoModelCapability(model)
+    if (reusedKeys.has('duration') && params.duration !== undefined && !capability.durations.includes(params.duration as never)) delete params.duration
+    if (reusedKeys.has('resolution') && params.resolution && !capability.resolutions.includes(params.resolution as never)) delete params.resolution
+    if (reusedKeys.has('aspect_ratio') && params.aspect_ratio && !capability.aspectRatios.includes(params.aspect_ratio as never)) delete params.aspect_ratio
+    if (reusedKeys.has('generate_audio') && capability.audioMode === 'required' && params.generate_audio === false) delete params.generate_audio
+    const requiredAspectRatio = capability.requiredAspectRatioByInputMode?.[videoInputMode(params)]
+    if (reusedKeys.has('aspect_ratio') && requiredAspectRatio && params.aspect_ratio !== requiredAspectRatio) delete params.aspect_ratio
+  }
+}
+
 function trimOptionalString(params: AnyRecord, key: string): void {
   if (params[key] === undefined) return
   if (typeof params[key] !== 'string') throw new Error(`${key} must be a string.`)
@@ -321,7 +432,7 @@ function trimOptionalString(params: AnyRecord, key: string): void {
   else delete params[key]
 }
 
-function normalizeWizardKnown(intent: 'image_gen' | 'image_edit' | 'video_gen', known: unknown, exec: AnyRecord): AnyRecord {
+function normalizeWizardKnown(intent: MediaIntent, known: unknown, _exec: AnyRecord): AnyRecord {
   if (known !== undefined && (known === null || typeof known !== 'object' || Array.isArray(known))) {
     throw new Error('known must be an object.')
   }
@@ -330,9 +441,8 @@ function normalizeWizardKnown(intent: 'image_gen' | 'image_edit' | 'video_gen', 
   for (const key of ['prompt', 'originalPrompt', 'promptSource', 'model', 'image', 'aspect_ratio', 'resolution', 'image_url', 'start_image', 'end_image']) {
     trimOptionalString(params, key)
   }
-  if (intent === 'image_edit' && !params.image && sessionUserImageRefs(exec).length === 1) params.image = 'dsh-attachment:latest'
-  if (params.promptSource !== undefined && !['user', 'inferred', 'wizard'].includes(params.promptSource)) {
-    throw new Error('promptSource must be user, inferred, or wizard.')
+  if (params.promptSource !== undefined && !['user', 'inferred', 'wizard', 'reused'].includes(params.promptSource)) {
+    throw new Error('promptSource must be user, inferred, wizard, or reused.')
   }
   for (const key of ['enhanced', 'useDefaultModel', 'skipFinalConfirmation', 'generate_audio']) {
     if (params[key] !== undefined && typeof params[key] !== 'boolean') throw new Error(`${key} must be a boolean.`)
@@ -350,7 +460,7 @@ function normalizeWizardKnown(intent: 'image_gen' | 'image_edit' | 'video_gen', 
   return params
 }
 
-function validateWizardKnown(intent: 'image_gen' | 'image_edit' | 'video_gen', params: AnyRecord, config: MediaConfig): void {
+function validateWizardKnown(intent: MediaIntent, params: AnyRecord, config: MediaConfig): void {
   const supportedModels = supportedModelsForIntent(intent)
   if (params.model && !supportedModels.includes(params.model)) {
     throw new Error(`Model ${params.model} is not supported for ${intent}. Choose one of: ${supportedModels.join(', ')}.`)
@@ -416,6 +526,26 @@ function imageBlocks(images: GeneratedImage[], label: string, model: string, tas
   return blocks
 }
 
+function pendingTaskFields(data: AnyRecord): AnyRecord {
+  return {
+    timedOut: true,
+    recoverable: true,
+    status: typeof data.status === 'string' ? data.status : 'running',
+    progress: typeof data.progress === 'number' ? data.progress : 0,
+  }
+}
+
+function pendingTaskBlock(value: AnyRecord): AnyRecord | undefined {
+  if (value.timedOut !== true) return undefined
+  return {
+    type: 'text',
+    text: [
+      `Task ${value.taskId} is still running (${value.progress ?? 0}%).`,
+      'The task id has been retained. Use media_task_status to continue checking; do not submit the generation again.',
+    ].join('\n'),
+  }
+}
+
 function imageOutputSchema(): AnyRecord {
   return {
     type: 'object',
@@ -424,6 +554,9 @@ function imageOutputSchema(): AnyRecord {
       taskId: { type: 'string', required: true },
       model: { type: 'string', required: true },
       timedOut: { type: 'boolean' },
+      recoverable: { type: 'boolean' },
+      status: { type: 'string' },
+      progress: { type: 'integer' },
       images: {
         type: 'array',
         required: true,
@@ -487,24 +620,49 @@ export function apply(ctx: AnyRecord, config: MediaConfig): void {
   ctx.systemPrompt.section({
     name: 'media-gen:wizard',
     order: 200,
-    text: `Before calling media_wizard, first infer the user's media intent and extract every relevant parameter already supplied by the user or current conversation into known. media_wizard is a missing-parameter completer, not a fixed questionnaire: do not ask the user to repeat information already present.
+    text: `Before calling media_wizard, infer the user's media intent and separate current-request parameters from reusable historical context. media_wizard is a missing-parameter completer and reuse-consent gate, not a fixed questionnaire.
 
-Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". For image editing, when the current or immediately preceding user request contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the user's requested change as prompt. When the user refers to an ordered image, use a 1-based selector such as dsh-attachment:1 or dsh-attachment:2; first, last, and index:N are also supported. Use a full current-conversation attachment id when it is available. If multiple images exist and the target or role is ambiguous, leave the image field absent so the wizard can ask instead of guessing. Extract explicit model, aspect ratio, image count, duration, resolution, audio-generation preference, input-image roles, and prompt-enhancement preference when stated. Leave genuinely unspecified or ambiguous values absent so the wizard can ask only for those values. Never invent a local path or URL for a chat attachment.
+Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". Put only values supplied by the current user request, its newly attached media, or an explicit reuse instruction into known. Do not silently copy a previous task's prompt, reference images, model, aspect ratio, count, duration, resolution, or audio choice into known. When the most recent completed task of the same intent contains potentially reusable values that the current request did not explicitly supply, put its intent and final params into previousTask instead. The wizard will ask for consent before merging them.
 
-Known-field contract: prompt is the user's requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when the user explicitly chose enhancement behavior; model is present only for an explicit supported model choice; useDefaultModel is true only when the user explicitly chose the plugin default; aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived. Set skipFinalConfirmation only when the user explicitly asks to proceed without further confirmation; never infer it merely because the request seems complete.
+For image editing, when the current request itself contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the current requested change as prompt. When the user refers to an ordered image, use dsh-attachment:1, dsh-attachment:2, first, last, index:N, or a current-conversation attachment id. If multiple images exist and the target or role is ambiguous, leave image absent. Never invent a local path or URL for a chat attachment.
 
-The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice. For video generation, pass the wizard's generate_audio value to media_generate_video when present.`,
+Known-field contract: prompt is the current requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when explicitly chosen; model is present only for an explicit supported model choice; useDefaultModel is true only after an explicit default-model choice; aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived from the current request. Set skipFinalConfirmation only when explicitly requested.
+
+Reuse contract: previousTask contains only the most recent completed same-intent task and its final params. reuse contains explicit per-category decisions only when the user already said whether to reuse prompt, references, or settings. Use true for explicit reuse and false for explicit reset. Leave a category absent when the request is ambiguous, such as "generate another video", so the wizard asks. Phrases such as "another identical one" can set all available categories true; "do not reuse anything" can set them false; "change the content but keep other settings" should set prompt false and settings true. Current known values always win over reused values.
+
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice. For video generation, pass the wizard's generate_audio value to media_generate_video when present.
+
+Submission safety contract: a network error, HTTP 429, unchanged progress, or a timed-out foreground wait does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, or says the submission status is uncertain, do not call a media_generate_* tool again for that request. Continue with media_task_status when a taskId is known. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`,
   })
 
   register({
     name: 'media_wizard',
-    description: 'Context-aware media task wizard. Infer intent and pass all user-supplied parameters in known; it asks only for missing values before media generation or editing.',
+    description: 'Context-aware media task wizard. Pass current-request values in known, prior same-intent task values in previousTask, and explicit reuse decisions in reuse. Historical values are never merged without consent.',
     parameters: {
       intent: { type: 'string', enum: ['image_gen', 'image_edit', 'video_gen'], required: true },
       known: {
         type: 'object',
         additionalProperties: true,
         description: 'Parameters already supplied or unambiguously derived from the user request. Supported fields include prompt, promptSource, enhanced, model, useDefaultModel, skipFinalConfirmation, image, aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images. Do not invent missing values.',
+      },
+      previousTask: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Most recent completed task of the same media intent, supplied only as reusable context candidates.',
+        properties: {
+          intent: { type: 'string', enum: ['image_gen', 'image_edit', 'video_gen'], required: true },
+          params: { type: 'object', additionalProperties: true, required: true },
+        },
+      },
+      reuse: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Explicit reuse decisions already stated by the user. Omit ambiguous categories so the wizard asks.',
+        properties: {
+          prompt: { type: 'boolean' },
+          references: { type: 'boolean' },
+          settings: { type: 'boolean' },
+        },
       },
     },
     output: {
@@ -519,6 +677,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
           modelExplicit: { type: 'boolean', required: true },
           finalConfirmed: { type: 'boolean', required: true },
           needsImage: { type: 'boolean' },
+          reuseDecisions: { type: 'object', additionalProperties: true },
           params: { type: 'object', additionalProperties: true, required: true },
         },
       },
@@ -530,13 +689,59 @@ The wizard must complete any remaining confirmation flow before media_generate_i
           `Model choice confirmed: ${value.modelChoiceConfirmed ? 'yes' : 'no'}`,
           `Model strategy: ${value.modelExplicit ? 'explicit model' : 'plugin default'}`,
           `Final confirmation: ${value.finalConfirmed ? 'yes' : 'no'}`,
+          `Reuse decisions: ${JSON.stringify(value.reuseDecisions ?? {})}`,
           `Parameters:\n${JSON.stringify(value.params, null, 2)}`,
         ].join('\n'),
       }],
     },
     async execute(args: AnyRecord, exec: AnyRecord) {
-      const intent = args.intent as 'image_gen' | 'image_edit' | 'video_gen'
+      const intent = args.intent as MediaIntent
       const params = normalizeWizardKnown(intent, args.known, exec)
+      validateWizardKnown(intent, params, config)
+      const contextCandidates = normalizeContextCandidates(intent, args.previousTask)
+      const reuseDecisions = normalizeReuseDecisions(args.reuse)
+      const reusablePrompt = missingReusableValues(params, contextCandidates, ['prompt'])
+      const reusableReferences = missingReusableValues(params, contextCandidates, REFERENCE_REUSE_KEYS[intent])
+      const reusableSettings = missingReusableValues(params, contextCandidates, SETTINGS_REUSE_KEYS[intent])
+      const reuseQuestions: AnyRecord[] = []
+      if (Object.keys(reusablePrompt).length && reuseDecisions.prompt === undefined) {
+        reuseQuestions.push({
+          id: 'reuse_prompt', header: '历史 Prompt', question: '是否复用上一次任务的 Prompt？',
+          detail: `上次 Prompt：${truncatedPrompt(reusablePrompt.prompt)}`,
+          options: [{ label: '不复用', description: '按本次新任务重新填写 Prompt' }, { label: '复用', description: '沿用上一次任务的 Prompt' }],
+        })
+      }
+      if (Object.keys(reusableReferences).length && reuseDecisions.references === undefined) {
+        reuseQuestions.push({
+          id: 'reuse_references', header: '历史参考素材', question: '是否复用上一次任务的参考图或首尾帧？',
+          detail: reusableReferenceDetail(intent, reusableReferences),
+          options: [{ label: '不复用', description: '本次不使用历史参考素材' }, { label: '复用', description: '沿用上一次任务的参考素材' }],
+        })
+      }
+      if (Object.keys(reusableSettings).length && reuseDecisions.settings === undefined) {
+        reuseQuestions.push({
+          id: 'reuse_settings', header: '历史生成参数', question: '是否复用上一次任务的生成参数？',
+          detail: reusableSettingsDetail(reusableSettings),
+          options: [{ label: '不复用', description: '重新选择模型和输出参数' }, { label: '复用', description: '沿用可兼容的模型和输出参数' }],
+        })
+      }
+      if (reuseQuestions.length) {
+        const answers = await ask(ctx, exec, reuseQuestions)
+        if (answers.reuse_prompt) reuseDecisions.prompt = stripRecommended(selected(answers.reuse_prompt)) === '复用'
+        if (answers.reuse_references) reuseDecisions.references = stripRecommended(selected(answers.reuse_references)) === '复用'
+        if (answers.reuse_settings) reuseDecisions.settings = stripRecommended(selected(answers.reuse_settings)) === '复用'
+      }
+      if (reuseDecisions.prompt === true) {
+        mergeReusableValues(params, reusablePrompt)
+        if (reusablePrompt.prompt && !params.promptSource) params.promptSource = 'reused'
+      }
+      if (reuseDecisions.references === true) mergeReusableValues(params, reusableReferences)
+      const reusedSettingKeys = new Set<string>()
+      if (reuseDecisions.settings === true) {
+        mergeReusableValues(params, reusableSettings)
+        for (const key of Object.keys(reusableSettings)) reusedSettingKeys.add(key)
+        pruneIncompatibleReusedSettings(intent, params, reusedSettingKeys, config)
+      }
       validateWizardKnown(intent, params, config)
       const promptProvidedBeforeWizard = Boolean(params.prompt)
       if (promptProvidedBeforeWizard && !params.promptSource) params.promptSource = 'user'
@@ -545,26 +750,23 @@ The wizard must complete any remaining confirmation flow before media_generate_i
       let modelChoiceConfirmed = false
       let modelExplicit = false
       let finalConfirmed = false
-      const result = () => ({ intent, confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed, promptConfirmed, modelChoiceConfirmed, modelExplicit, finalConfirmed, needsImage, params })
+      const result = () => ({ intent, confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed, promptConfirmed, modelChoiceConfirmed, modelExplicit, finalConfirmed, needsImage, reuseDecisions, params })
       try {
         if (intent === 'image_edit' && !params.image) {
           const imageCount = sessionUserImageRefs(exec).length
-          if (imageCount === 1) params.image = 'dsh-attachment:latest'
-          else {
-            const answers = await ask(ctx, exec, [{
-              id: 'image', header: '参考图',
-              question: imageCount > 1
-                ? `当前对话有 ${imageCount} 张用户上传图片。请输入 dsh-attachment:1 至 dsh-attachment:${imageCount}，或输入 HTTPS URL / 本地图片路径`
-                : '当前对话中没有用户上传的图片。请输入 HTTPS URL / 本地图片路径',
-            }])
-            params.image = selected(answers.image)
-            if (!params.image) { needsImage = true; return result() }
-          }
+          const answers = await ask(ctx, exec, [{
+            id: 'image', header: '参考图',
+            question: imageCount > 0
+              ? `历史图片不会自动复用。请明确输入 dsh-attachment:1 至 dsh-attachment:${imageCount}，或提供 HTTPS URL / 本地图片路径`
+              : '当前对话中没有用户上传的图片。请输入 HTTPS URL / 本地图片路径',
+          }])
+          params.image = selected(answers.image)
+          if (!params.image) { needsImage = true; return result() }
         }
         if (intent === 'video_gen') {
           const hasInput = params.image_url || params.start_image || params.end_image || (Array.isArray(params.reference_images) && params.reference_images.length)
           if (!hasInput && !params.prompt) {
-            const answers = await ask(ctx, exec, [{ id: 'video_input', header: '视频类型', question: '选择视频生成方式', options: [{ label: '纯文生视频 (Recommended)' }, { label: '使用首帧图片' }, { label: '使用首帧和尾帧图片' }] }])
+            const answers = await ask(ctx, exec, [{ id: 'video_input', header: '视频类型', question: '选择视频生成方式', options: [{ label: '纯文生视频（推荐）' }, { label: '使用首帧图片' }, { label: '使用首帧和尾帧图片' }] }])
             const choice = stripRecommended(selected(answers.video_input))
             if (!choice) return result()
             if (choice === '使用首帧图片') {
@@ -600,9 +802,15 @@ The wizard must complete any remaining confirmation flow before media_generate_i
         }
         if (params.enhanced === undefined) {
           const enhanceOptions = config.enhanceEnabled
-            ? [{ label: '增强 Prompt (Recommended)', description: '优化视觉、镜头和质量细节' }, { label: '保持原始 Prompt', description: '不修改内容描述' }]
-            : [{ label: '保持原始 Prompt (Recommended)', description: '当前未启用提示词增强服务' }]
-          const answers = await ask(ctx, exec, [{ id: 'enhance', header: 'Prompt 增强', question: '是否增强 Prompt？', options: enhanceOptions }])
+            ? [{ label: '增强 Prompt（推荐）', description: '优化视觉、镜头和质量细节' }, { label: '保持原始 Prompt', description: '不修改内容描述' }]
+            : [{ label: '保持原始 Prompt（推荐）', description: '当前未启用提示词增强服务' }]
+          const answers = await ask(ctx, exec, [{
+            id: 'enhance',
+            header: 'Prompt 增强',
+            question: '是否增强下面的 Prompt？',
+            detail: `当前 Prompt\n来源：${promptSourceDescription(params.promptSource)}\n\n${params.prompt}`,
+            options: enhanceOptions,
+          }])
           const choice = stripRecommended(selected(answers.enhance))
           if (!choice) return result()
           if (choice === '增强 Prompt') {
@@ -615,7 +823,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
         }
         const promptWasEnhanced = Boolean(params.originalPrompt && params.prompt !== params.originalPrompt)
         if (promptWasEnhanced) {
-          const promptAnswers = await ask(ctx, exec, [{ id: 'prompt_confirm', header: '确认增强后 Prompt', question: 'Prompt 已被增强，是否使用增强后的内容？', detail: `原始 Prompt:\n${params.originalPrompt}\n\n增强后 Prompt:\n${params.prompt}`, options: [{ label: '确认增强后 Prompt (Recommended)' }, { label: '取消' }] }])
+          const promptAnswers = await ask(ctx, exec, [{ id: 'prompt_confirm', header: '确认增强后 Prompt', question: 'Prompt 已被增强，是否使用增强后的内容？', detail: `原始 Prompt:\n${params.originalPrompt}\n\n增强后 Prompt:\n${params.prompt}`, options: [{ label: '确认增强后 Prompt（推荐）' }, { label: '取消' }] }])
           promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === '确认增强后 Prompt'
         } else promptConfirmed = Boolean(params.prompt)
         if (!promptConfirmed) return result()
@@ -626,7 +834,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
         } else if (params.useDefaultModel === true) {
           modelChoiceConfirmed = true; modelExplicit = false; delete params.model
         } else {
-          const defaultModelLabel = `${defaultModel}（插件默认）`
+          const defaultModelLabel = `${defaultModel}（推荐）`
           const modelOptions = selectableModels.map((model) => ({
             label: model === defaultModel ? defaultModelLabel : model,
             ...(intent === 'video_gen'
@@ -650,16 +858,16 @@ The wizard must complete any remaining confirmation flow before media_generate_i
           if (videoCapability.audioMode === 'required' && params.generate_audio === undefined) params.generate_audio = true
         }
         const outputQuestions: AnyRecord[] = []
-        if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === '1:1' ? `${ratio} (Recommended)` : ratio })) })
-        if (intent === 'image_edit' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio} (Recommended)` : ratio })) })
+        if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === '1:1' ? `${ratio}（推荐）` : ratio })) })
+        if (intent === 'image_edit' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio}（推荐）` : ratio })) })
         if (intent === 'video_gen' && videoCapability && selectedVideoInputMode && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: videoCapability.aspectRatios.map((ratio) => {
           const label = videoAspectRatioLabel(ratio, selectedVideoInputMode)
-          return { label: ratio === videoCapability.defaultAspectRatio ? `${label} (Recommended)` : label }
+          return { label: ratio === videoCapability.defaultAspectRatio ? `${label}（推荐）` : label }
         }) })
-        if (intent === 'video_gen' && videoCapability && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: videoCapability.durations.map((duration) => ({ label: duration === videoCapability.defaultDuration ? `${duration} 秒 (Recommended)` : `${duration} 秒` })) })
-        if (intent === 'video_gen' && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: videoCapability.resolutions.map((resolution) => ({ label: resolution === videoCapability.defaultResolution ? `${resolution} (Recommended)` : resolution })) })
-        if (intent === 'video_gen' && videoCapability?.audioMode === 'optional' && params.generate_audio === undefined) outputQuestions.push({ id: 'generate_audio', header: '生成音频', question: '是否生成视频音频？', options: [{ label: '开启音频 (Recommended)', description: '视频将包含模型生成的音频' }, { label: '关闭音频', description: '生成无音频视频' }] })
-        if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({ id: 'n', header: '数量', question: '生成几张？', options: [{ label: '1 张 (Recommended)' }, { label: '2 张' }, { label: '4 张' }] })
+        if (intent === 'video_gen' && videoCapability && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: videoCapability.durations.map((duration) => ({ label: duration === videoCapability.defaultDuration ? `${duration} 秒（推荐）` : `${duration} 秒` })) })
+        if (intent === 'video_gen' && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: videoCapability.resolutions.map((resolution) => ({ label: resolution === videoCapability.defaultResolution ? `${resolution}（推荐）` : resolution })) })
+        if (intent === 'video_gen' && videoCapability?.audioMode === 'optional' && params.generate_audio === undefined) outputQuestions.push({ id: 'generate_audio', header: '生成音频', question: '是否生成视频音频？', options: [{ label: '开启音频（推荐）', description: '视频将包含模型生成的音频' }, { label: '关闭音频', description: '生成无音频视频' }] })
+        if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({ id: 'n', header: '数量', question: '生成几张？', options: [{ label: '1 张（推荐）' }, { label: '2 张' }, { label: '4 张' }] })
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions)
           if (answers.aspect_ratio) params.aspect_ratio = intent === 'video_gen'
@@ -692,7 +900,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
           `- 任务: ${taskLabel}`, ...inputLines, `- 内容: ${params.prompt}`,
           `- Prompt 来源: ${params.promptSource ?? (promptProvidedBeforeWizard ? 'user' : 'wizard')}`,
           `- Prompt 增强: ${promptWasEnhanced ? '已增强' : '未增强'}`,
-          `- 模型: ${params.model ?? `${defaultModel}（插件默认）`}`,
+          `- 模型: ${params.model ?? `${defaultModel}（推荐）`}`,
           `- 画面比例: ${intent === 'video_gen' && selectedVideoInputMode ? videoAspectRatioLabel(params.aspect_ratio, selectedVideoInputMode) : params.aspect_ratio}`,
           ...(params.duration ? [`- 时长: ${params.duration} 秒`] : []),
           ...(intent === 'video_gen' && videoCapability ? [`- 分辨率: ${params.resolution ?? videoCapability.defaultResolution}`] : []),
@@ -701,7 +909,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
         ]
         if (params.skipFinalConfirmation === true) finalConfirmed = true
         else {
-          const finalAnswers = await ask(ctx, exec, [{ id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: parameterLines.join('\n'), options: [{ label: '确认生成 (Recommended)' }, { label: '取消' }] }])
+          const finalAnswers = await ask(ctx, exec, [{ id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: parameterLines.join('\n'), options: [{ label: '确认生成（推荐）' }, { label: '取消' }] }])
           finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === '确认生成'
         }
         return result()
@@ -723,16 +931,22 @@ The wizard must complete any remaining confirmation flow before media_generate_i
     },
     output: {
       schema: imageOutputSchema(),
-      render: (_args: unknown, value: AnyRecord) => imageBlocks(value.images, 'Generated images', value.model, value.taskId),
+      render: (_args: unknown, value: AnyRecord) => {
+        const blocks = imageBlocks(value.images, 'Generated images', value.model, value.taskId)
+        const pending = pendingTaskBlock(value)
+        if (pending) blocks.push(pending)
+        return blocks
+      },
     },
     async execute(args: AnyRecord, exec: AnyRecord) {
       const model = args.model ?? config.defaultImageModel
-      const taskId = await api.submit('images', { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio ?? '1:1', n: args.n ?? 1 }, exec.signal)
+      const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio ?? '1:1', n: args.n ?? 1 }
+      const taskId = await api.submit('images', body, exec.signal, body)
       const data = await api.poll(taskId, exec.signal)
       const timedOut = data.timedOut === true
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal)
       if (!timedOut && images.length > 0) exec.concludeTurn()
-      return { taskId, model, images, ...(timedOut ? { timedOut: true } : {}) }
+      return { taskId, model, images, ...(timedOut ? pendingTaskFields(data) : {}) }
     },
   })
 
@@ -763,12 +977,13 @@ The wizard must complete any remaining confirmation flow before media_generate_i
         ...(args.aspect_ratio ? { aspect_ratio: args.aspect_ratio } : {}),
         input_references: [{ type: 'image_url', slot_name: 'reference_1', image_url: { url: image } }],
       }
-      const taskId = await api.submit('images', body, exec.signal)
+      const deduplicationInput = { ...args, model, image: args.image ?? 'dsh-attachment:latest' }
+      const taskId = await api.submit('images', body, exec.signal, deduplicationInput)
       const data = await api.poll(taskId, exec.signal)
       const timedOut = data.timedOut === true
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal)
       if (!timedOut && images.length > 0) exec.concludeTurn()
-      return { taskId, model, images, ...(timedOut ? { timedOut: true } : {}) }
+      return { taskId, model, images, ...(timedOut ? pendingTaskFields(data) : {}) }
     },
   })
 
@@ -785,6 +1000,9 @@ The wizard must complete any remaining confirmation flow before media_generate_i
       fps: { type: 'integer' },
       generateAudio: { type: 'boolean' },
       timedOut: { type: 'boolean' },
+      recoverable: { type: 'boolean' },
+      status: { type: 'string' },
+      progress: { type: 'integer' },
       error: { type: 'string' },
     },
   }
@@ -798,7 +1016,7 @@ The wizard must complete any remaining confirmation flow before media_generate_i
       ...(value.url ? [`URL: ${value.url}`] : []),
       ...(typeof value.generateAudio === 'boolean' ? [`Audio: ${value.generateAudio ? 'enabled' : 'disabled'}`] : []),
       ...(value.error ? [`Local save warning: ${value.error}`] : []),
-      ...(value.timedOut ? ['Task is still running. Use media_task_status with this task id.'] : []),
+      ...(value.timedOut ? [`Task is still running (${value.progress ?? 0}%). Use media_task_status with this task id; do not submit the generation again.`] : []),
     ]
     blocks.push({ type: 'text', text: lines.join('\n') })
     return blocks
@@ -861,9 +1079,16 @@ The wizard must complete any remaining confirmation flow before media_generate_i
         ...(capability.generateAudioParameter === 'optional' ? { generate_audio: generateAudio } : {}),
         ...(frameImages.length ? { frame_images: frameImages } : {}),
       }
-      const taskId = await api.submit('videos', body, exec.signal)
+      const deduplicationInput = {
+        ...args,
+        model,
+        ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+        generate_audio: generateAudio,
+        ...(firstInput ? { start_image: firstInput } : {}),
+      }
+      const taskId = await api.submit('videos', body, exec.signal, deduplicationInput)
       const data = await api.poll(taskId, exec.signal)
-      if (data.timedOut === true) return { taskId, model, timedOut: true }
+      if (data.timedOut === true) return { taskId, model, generateAudio, ...pendingTaskFields(data) }
       const url = api.urls(data)[0]
       const saved = await saveVideo(url, taskId, config, exec.signal)
       const media = data.media && typeof data.media === 'object' ? data.media as AnyRecord : {}

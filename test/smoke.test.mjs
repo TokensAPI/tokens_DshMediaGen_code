@@ -26,3 +26,9 @@ test('client bundle exposes per-image downloads through the safe host route', as
   assert.match(client, /M12 3v11m0 0 4-4/)
   assert.match(client, /download: filename/)
 })
+
+test('wizard recommendation labels use plain Chinese text instead of the UI badge trigger', async () => {
+  const host = await readFile(new URL('../dist/index.js', import.meta.url), 'utf8')
+  assert.doesNotMatch(host, /\(Recommended\)/)
+  assert.match(host, /\\uFF08\\u63A8\\u8350\\uFF09/)
+})
