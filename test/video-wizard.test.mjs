@@ -9,7 +9,7 @@ const config = {
   maxPollMs: 720000,
   defaultImageModel: 'z_image_turbo',
   defaultEditModel: 'qwen_image',
-  defaultVideoModel: 'ltx_2_5',
+  defaultVideoModel: 'minimax_h3',
   enhanceEnabled: true,
   enhanceApiKeyEnv: 'TOKENSAPI_API_KEY',
   enhanceBaseURL: 'https://tokensapi.ai/v1',
@@ -17,8 +17,8 @@ const config = {
   enhanceMaxChars: 4000,
   allowLocalImageInput: true,
   maxInputImageBytes: 30 * 1024 * 1024,
-  imageUploadURL: 'https://tokensapi.ai/api/aigc/presign',
-  uploadAuthMode: 'account',
+  imageUploadURL: 'https://tokensapi.ai/v1/assets/images',
+  uploadAuthMode: 'api_key',
   accountAccessTokenEnv: 'TOKENSAPI_ACCOUNT_ACCESS_TOKEN',
   accountUserId: '',
   storageBackend: 'presign',
@@ -103,11 +103,11 @@ test('enhanced prompt comparison preserves the exact original prompt', async () 
   let comparisonDetail = ''
   const { mod, tools } = await createHarness((questions) => {
     const enhanceQuestion = questions.find((question) => question.id === 'enhance')
-    if (enhanceQuestion) return { answers: [{ id: 'enhance', selected: ['增强 Prompt（推荐）'] }] }
+    if (enhanceQuestion) return { answers: [{ id: 'enhance', selected: ['增强 Prompt'] }] }
     const confirmQuestion = questions.find((question) => question.id === 'prompt_confirm')
     if (confirmQuestion) {
       comparisonDetail = confirmQuestion.detail
-      return { answers: [{ id: 'prompt_confirm', selected: ['确认增强后 Prompt（推荐）'] }] }
+      return { answers: [{ id: 'prompt_confirm', selected: ['确认增强后 Prompt'] }] }
     }
     return { answers: [] }
   })
@@ -188,7 +188,7 @@ test('confirmed reuse merges prior values and marks the prompt source as reused'
     const finalQuestion = questions.find((question) => question.id === 'final_confirm')
     if (finalQuestion) {
       finalDetail = finalQuestion.detail
-      return { answers: [{ id: 'final_confirm', selected: ['确认生成（推荐）'] }] }
+      return { answers: [{ id: 'final_confirm', selected: ['确认生成'] }] }
     }
     return { answers: [] }
   })
@@ -276,16 +276,43 @@ test('video wizard model selection exposes all 0.3.3 models with capability desc
   const modelQuestion = questionCalls.flat().find((question) => question.id === 'model')
   assert.ok(modelQuestion)
   assert.deepEqual(modelQuestion.options.map((option) => option.label), [
-    'minimax_h3',
-    'ltx_2_5（推荐）',
+    'minimax_h3（推荐）',
+    'ltx_2_5',
     'ltx_2_3',
     'seedance_2_5',
     'seedance_2_0',
   ])
-  const ltx25 = modelQuestion.options.find((option) => option.label === 'ltx_2_5（推荐）')
+  const ltx25 = modelQuestion.options.find((option) => option.label === 'ltx_2_5')
   assert.match(ltx25.description, /5\/10 秒/)
   assert.match(ltx25.description, /720p\/1080p/)
   assert.doesNotMatch(ltx25.description, /1440p/)
+})
+
+test('wizard recommendation marker appears only in model selection', async () => {
+  const { tools, questionCalls } = await createHarness((questions) => ({
+    answers: questions.map((question) => {
+      if (question.id === 'enhance') return { id: question.id, selected: ['保持原始 Prompt'] }
+      if (question.id === 'model') return { id: question.id, selected: ['seedance_2_5'] }
+      if (question.id === 'generate_audio') return { id: question.id, selected: ['开启音频'] }
+      if (question.id === 'final_confirm') return { id: question.id, selected: ['确认生成'] }
+      return { id: question.id, selected: [question.options?.[0]?.label].filter(Boolean) }
+    }),
+  }))
+  const wizard = tools.get('media_wizard')
+
+  const result = await wizard.execute({
+    intent: 'video_gen',
+    known: { prompt: 'A product reveal in a bright studio' },
+  }, execContext())
+
+  assert.equal(result.confirmed, true)
+  const optionQuestions = questionCalls.flat().filter((question) => Array.isArray(question.options))
+  const recommendedOptions = optionQuestions.flatMap((question) => question.options
+    .filter((option) => option.label.includes('（推荐）'))
+    .map((option) => ({ questionId: question.id, label: option.label })))
+  assert.deepEqual(recommendedOptions, [{ questionId: 'model', label: 'minimax_h3（推荐）' }])
+  const finalQuestion = optionQuestions.find((question) => question.id === 'final_confirm')
+  assert.doesNotMatch(finalQuestion.detail, /推荐/)
 })
 
 test('seedance 2.5 first-frame wizard enforces adaptive ratio and allows disabling audio', async () => {
@@ -296,7 +323,7 @@ test('seedance 2.5 first-frame wizard enforces adaptive ratio and allows disabli
     const finalQuestion = questions.find((question) => question.id === 'final_confirm')
     if (finalQuestion) {
       finalDetail = finalQuestion.detail
-      return { answers: [{ id: 'final_confirm', selected: ['确认生成（推荐）'] }] }
+      return { answers: [{ id: 'final_confirm', selected: ['确认生成'] }] }
     }
     return { answers: [] }
   })
@@ -319,7 +346,7 @@ test('seedance 2.5 first-frame wizard enforces adaptive ratio and allows disabli
   assert.equal(result.params.generate_audio, false)
   const audioQuestion = questionCalls.flat().find((question) => question.id === 'generate_audio')
   assert.deepEqual(audioQuestion.options.map((option) => option.label), [
-    '开启音频（推荐）',
+    '开启音频',
     '关闭音频',
   ])
   assert.match(finalDetail, /- 画面比例: adaptive（自动匹配输入图片比例）/)
@@ -371,7 +398,7 @@ test('video wizard final confirmation summarizes fixed generated audio', async (
     const finalQuestion = questions.find((question) => question.id === 'final_confirm')
     if (!finalQuestion) return { answers: [] }
     finalDetail = finalQuestion.detail
-    return { answers: [{ id: 'final_confirm', selected: ['确认生成（推荐）'] }] }
+    return { answers: [{ id: 'final_confirm', selected: ['确认生成'] }] }
   })
   const wizard = tools.get('media_wizard')
 

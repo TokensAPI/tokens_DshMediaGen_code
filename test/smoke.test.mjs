@@ -32,3 +32,9 @@ test('wizard recommendation labels use plain Chinese text instead of the UI badg
   assert.doesNotMatch(host, /\(Recommended\)/)
   assert.match(host, /\\uFF08\\u63A8\\u8350\\uFF09/)
 })
+
+test('default image upload configuration uses the API-key assets endpoint', async () => {
+  const source = await readFile(new URL('../src/host/index.ts', import.meta.url), 'utf8')
+  assert.match(source, /imageUploadURL: Schema\.string\(\)\.default\('https:\/\/tokensapi\.ai\/v1\/assets\/images'\)/)
+  assert.match(source, /uploadAuthMode: Schema\.union\(\['account', 'api_key'\]\)\.default\('api_key'\)/)
+})

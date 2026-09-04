@@ -41,7 +41,7 @@ LTX 2.5 不支持 `1440p`，插件不会显示或提交该分辨率。Seedance 2
 
 TokensAPI 生产任务接口要求参考图片是公开可访问的 HTTPS URL。插件不会把本地图片上传到 `uguu.se`、`tmpfiles.org` 或其他第三方临时图床。
 
-本地图片和当前对话中的 DSH 图片附件使用第一方存储上传，不经过第三方临时图床。默认模式向 TokensAPI `/api/aigc/presign` 申请 `upload_url` 和 `access_url`，再用原始字节 `PUT`；也可以配置 `storageBackend: r2`，通过 S3 Signature V4 将图片直接上传到自己的 Cloudflare R2/S3 兼容存储，并把 CDN URL 提交给模型。聊天附件始终通过 DSH 官方 `attachments.readImage()` 接口读取和校验，不暴露或猜测用户原始文件路径。
+本地图片和当前对话中的 DSH 图片附件使用第一方存储上传，不经过第三方临时图床。从 `0.3.5` 开始，默认使用现有 TokensAPI API Key 调用 `/v1/assets/images`，校验返回的上传方法、签名请求头、有效期和 HTTPS URL，再由 TokensCowork Host 将原始图片字节直接上传到 `upload_url`。API Key 不会发送给 S3，上传不允许自动重定向；只有 S3 返回成功的 2xx 后，插件才会把 `access_url` 提交给图片或视频模型。也可以配置 `storageBackend: r2`，通过 S3 Signature V4 将图片直接上传到自己的 Cloudflare R2/S3 兼容存储。聊天附件始终通过 DSH 官方 `attachments.readImage()` 接口读取和校验，不暴露或猜测用户原始文件路径。
 
 ## 分发与安装
 
@@ -107,7 +107,7 @@ pnpm add ~/Downloads/tokens-dsh-media-gen-<版本号>.tgz
       config:
         defaultImageModel: z_image_turbo
         defaultEditModel: qwen_image
-        defaultVideoModel: ltx_2_5
+        defaultVideoModel: minimax_h3
         enhanceEnabled: true
 ```
 
@@ -131,7 +131,7 @@ pnpm add ~/Downloads/tokens-dsh-media-gen-<版本号>.tgz
 - `image2`
 - `qwen_image`
 
-图片编辑应显示 `qwen_image（推荐）` 和 `image2`；视频模型固定显示为 `minimax_h3`、`ltx_2_5（推荐）`、`ltx_2_3`、`seedance_2_5`、`seedance_2_0`。所有推荐项都使用普通文本 `（推荐）`，不再触发绿色推荐徽标。模型列表中的 `（推荐）` 表示插件当前默认模型，选择它时工具调用不会显式传入 `model`，而是由插件当前配置决定模型。
+图片编辑应显示 `qwen_image（推荐）` 和 `image2`；视频模型固定显示为 `minimax_h3（推荐）`、`ltx_2_5`、`ltx_2_3`、`seedance_2_5`、`seedance_2_0`。只有模型选择中的默认模型显示普通文本 `（推荐）`；视频类型、Prompt 增强、比例、时长、分辨率、音频、数量和确认项都不显示推荐标记。模型列表中的 `（推荐）` 表示插件当前默认模型，选择它时工具调用不会显式传入 `model`，而是由插件当前配置决定模型。
 
 ### 常见安装问题
 
@@ -153,24 +153,7 @@ TOKENSAPI_API_KEY
 
 提示词增强默认开启，并默认复用现有的 `TOKENSAPI_API_KEY`，通过 `https://tokensapi.ai/v1` 的 `deepseek-v4-flash` 模型增强图片和视频 Prompt，不需要额外配置 `DEEPSEEK_API_KEY`。如需使用其他兼容 OpenAI Chat Completions 的增强服务，可覆盖 `enhanceApiKeyEnv`、`enhanceBaseURL` 和 `enhanceModel`。
 
-本地图片预签名上传当前生产环境默认需要额外配置账户身份：
-
-```text
-TOKENSAPI_ACCOUNT_ACCESS_TOKEN
-```
-
-并在插件配置中填写数字用户 ID：
-
-```yaml
-- insert:
-    - id: media-gen
-      name: '@tokensapi/dsh-media-gen'
-      config:
-        uploadAuthMode: account
-        accountUserId: "你的数字用户ID"
-```
-
-如果 TokensAPI 将 `/api/aigc/presign` 改为 `TokenOrUserAuth`，可以只使用现有的 `TOKENSAPI_API_KEY`：
+从 `0.3.5` 开始，本地图片和对话附件上传默认复用同一个 `TOKENSAPI_API_KEY`，不需要额外配置账户访问令牌或用户 ID：
 
 ```yaml
 - insert:
@@ -180,7 +163,20 @@ TOKENSAPI_ACCOUNT_ACCESS_TOKEN
         uploadAuthMode: api_key
 ```
 
-文生图、文生视频和使用公开 HTTPS 图片通常不需要这组本地上传身份。不要把自己的 API Key、账户令牌或用户 ID 写进安装包后分享给别人。
+如果已有私有部署仍使用旧 `/api/aigc/presign` 和账户鉴权，可以显式保留兼容配置：
+
+```yaml
+- insert:
+    - id: media-gen
+      name: '@tokensapi/dsh-media-gen'
+      config:
+        imageUploadURL: https://tokensapi.ai/api/aigc/presign
+        uploadAuthMode: account
+        accountAccessTokenEnv: TOKENSAPI_ACCOUNT_ACCESS_TOKEN
+        accountUserId: "你的数字用户ID"
+```
+
+不要把自己的 API Key、账户令牌或用户 ID 写进安装包后分享给别人。
 
 ## 默认配置
 
@@ -192,15 +188,15 @@ pollIntervalMs: 5000
 maxPollMs: 720000
 defaultImageModel: z_image_turbo
 defaultEditModel: qwen_image
-defaultVideoModel: ltx_2_5
+defaultVideoModel: minimax_h3
 enhanceEnabled: true
 enhanceApiKeyEnv: TOKENSAPI_API_KEY
 enhanceBaseURL: https://tokensapi.ai/v1
 enhanceModel: deepseek-v4-flash
 allowLocalImageInput: true
 maxInputImageBytes: 31457280
-imageUploadURL: https://tokensapi.ai/api/aigc/presign
-uploadAuthMode: account
+imageUploadURL: https://tokensapi.ai/v1/assets/images
+uploadAuthMode: api_key
 accountAccessTokenEnv: TOKENSAPI_ACCOUNT_ACCESS_TOKEN
 accountUserId: ""
 storageBackend: presign

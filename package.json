@@ -1,6 +1,6 @@
 {
   "name": "@tokensapi/dsh-media-gen",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Context-aware TokensAPI image and video generation tools for DeepSeek Harness",
   "license": "MIT",
   "repository": {

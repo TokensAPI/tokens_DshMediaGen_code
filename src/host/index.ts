@@ -20,6 +20,8 @@ import {
 import { saveImages, saveVideo } from './results.js'
 import { TokensApiClient } from './tokensapi.js'
 export { TokensApiClient } from './tokensapi.js'
+export { parseImageUploadGrant, validateImageUploadGrant } from './image-upload.js'
+export type { ImageUploadGrant, ImageUploadProtocol, ImageUploadValidationOptions } from './image-upload.js'
 export {
   VIDEO_MODEL_CAPABILITIES,
   VIDEO_MODEL_IDS,
@@ -48,7 +50,7 @@ export const Config = Schema.object({
   maxPollMs: Schema.number().default(12 * 60 * 1000),
   defaultImageModel: Schema.union([...IMAGE_MODELS]).default('z_image_turbo'),
   defaultEditModel: Schema.union([...IMAGE_EDIT_MODELS]).default('qwen_image'),
-  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default('ltx_2_5'),
+  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default('minimax_h3'),
   enhanceEnabled: Schema.boolean().default(true),
   enhanceApiKeyEnv: Schema.string().role('credential-ref').default('TOKENSAPI_API_KEY'),
   enhanceBaseURL: Schema.string().default('https://tokensapi.ai/v1'),
@@ -56,8 +58,8 @@ export const Config = Schema.object({
   enhanceMaxChars: Schema.number().default(4000),
   allowLocalImageInput: Schema.boolean().default(true),
   maxInputImageBytes: Schema.number().default(30 * 1024 * 1024),
-  imageUploadURL: Schema.string().default('https://tokensapi.ai/api/aigc/presign'),
-  uploadAuthMode: Schema.union(['account', 'api_key']).default('account'),
+  imageUploadURL: Schema.string().default('https://tokensapi.ai/v1/assets/images'),
+  uploadAuthMode: Schema.union(['account', 'api_key']).default('api_key'),
   accountAccessTokenEnv: Schema.string().role('credential-ref').default('TOKENSAPI_ACCOUNT_ACCESS_TOKEN'),
   accountUserId: Schema.string().default(''),
   storageBackend: Schema.union(['presign', 'r2']).default('presign'),
@@ -766,7 +768,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         if (intent === 'video_gen') {
           const hasInput = params.image_url || params.start_image || params.end_image || (Array.isArray(params.reference_images) && params.reference_images.length)
           if (!hasInput && !params.prompt) {
-            const answers = await ask(ctx, exec, [{ id: 'video_input', header: '视频类型', question: '选择视频生成方式', options: [{ label: '纯文生视频（推荐）' }, { label: '使用首帧图片' }, { label: '使用首帧和尾帧图片' }] }])
+            const answers = await ask(ctx, exec, [{ id: 'video_input', header: '视频类型', question: '选择视频生成方式', options: [{ label: '纯文生视频' }, { label: '使用首帧图片' }, { label: '使用首帧和尾帧图片' }] }])
             const choice = stripRecommended(selected(answers.video_input))
             if (!choice) return result()
             if (choice === '使用首帧图片') {
@@ -802,8 +804,8 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         }
         if (params.enhanced === undefined) {
           const enhanceOptions = config.enhanceEnabled
-            ? [{ label: '增强 Prompt（推荐）', description: '优化视觉、镜头和质量细节' }, { label: '保持原始 Prompt', description: '不修改内容描述' }]
-            : [{ label: '保持原始 Prompt（推荐）', description: '当前未启用提示词增强服务' }]
+            ? [{ label: '增强 Prompt', description: '优化视觉、镜头和质量细节' }, { label: '保持原始 Prompt', description: '不修改内容描述' }]
+            : [{ label: '保持原始 Prompt', description: '当前未启用提示词增强服务' }]
           const answers = await ask(ctx, exec, [{
             id: 'enhance',
             header: 'Prompt 增强',
@@ -823,7 +825,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         }
         const promptWasEnhanced = Boolean(params.originalPrompt && params.prompt !== params.originalPrompt)
         if (promptWasEnhanced) {
-          const promptAnswers = await ask(ctx, exec, [{ id: 'prompt_confirm', header: '确认增强后 Prompt', question: 'Prompt 已被增强，是否使用增强后的内容？', detail: `原始 Prompt:\n${params.originalPrompt}\n\n增强后 Prompt:\n${params.prompt}`, options: [{ label: '确认增强后 Prompt（推荐）' }, { label: '取消' }] }])
+          const promptAnswers = await ask(ctx, exec, [{ id: 'prompt_confirm', header: '确认增强后 Prompt', question: 'Prompt 已被增强，是否使用增强后的内容？', detail: `原始 Prompt:\n${params.originalPrompt}\n\n增强后 Prompt:\n${params.prompt}`, options: [{ label: '确认增强后 Prompt' }, { label: '取消' }] }])
           promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === '确认增强后 Prompt'
         } else promptConfirmed = Boolean(params.prompt)
         if (!promptConfirmed) return result()
@@ -858,16 +860,16 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           if (videoCapability.audioMode === 'required' && params.generate_audio === undefined) params.generate_audio = true
         }
         const outputQuestions: AnyRecord[] = []
-        if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === '1:1' ? `${ratio}（推荐）` : ratio })) })
-        if (intent === 'image_edit' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio}（推荐）` : ratio })) })
+        if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio })) })
+        if (intent === 'image_edit' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio) => ({ label: ratio })) })
         if (intent === 'video_gen' && videoCapability && selectedVideoInputMode && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: videoCapability.aspectRatios.map((ratio) => {
           const label = videoAspectRatioLabel(ratio, selectedVideoInputMode)
-          return { label: ratio === videoCapability.defaultAspectRatio ? `${label}（推荐）` : label }
+          return { label }
         }) })
-        if (intent === 'video_gen' && videoCapability && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: videoCapability.durations.map((duration) => ({ label: duration === videoCapability.defaultDuration ? `${duration} 秒（推荐）` : `${duration} 秒` })) })
-        if (intent === 'video_gen' && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: videoCapability.resolutions.map((resolution) => ({ label: resolution === videoCapability.defaultResolution ? `${resolution}（推荐）` : resolution })) })
-        if (intent === 'video_gen' && videoCapability?.audioMode === 'optional' && params.generate_audio === undefined) outputQuestions.push({ id: 'generate_audio', header: '生成音频', question: '是否生成视频音频？', options: [{ label: '开启音频（推荐）', description: '视频将包含模型生成的音频' }, { label: '关闭音频', description: '生成无音频视频' }] })
-        if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({ id: 'n', header: '数量', question: '生成几张？', options: [{ label: '1 张（推荐）' }, { label: '2 张' }, { label: '4 张' }] })
+        if (intent === 'video_gen' && videoCapability && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: videoCapability.durations.map((duration) => ({ label: `${duration} 秒` })) })
+        if (intent === 'video_gen' && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: videoCapability.resolutions.map((resolution) => ({ label: resolution })) })
+        if (intent === 'video_gen' && videoCapability?.audioMode === 'optional' && params.generate_audio === undefined) outputQuestions.push({ id: 'generate_audio', header: '生成音频', question: '是否生成视频音频？', options: [{ label: '开启音频', description: '视频将包含模型生成的音频' }, { label: '关闭音频', description: '生成无音频视频' }] })
+        if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({ id: 'n', header: '数量', question: '生成几张？', options: [{ label: '1 张' }, { label: '2 张' }, { label: '4 张' }] })
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions)
           if (answers.aspect_ratio) params.aspect_ratio = intent === 'video_gen'
@@ -900,7 +902,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           `- 任务: ${taskLabel}`, ...inputLines, `- 内容: ${params.prompt}`,
           `- Prompt 来源: ${params.promptSource ?? (promptProvidedBeforeWizard ? 'user' : 'wizard')}`,
           `- Prompt 增强: ${promptWasEnhanced ? '已增强' : '未增强'}`,
-          `- 模型: ${params.model ?? `${defaultModel}（推荐）`}`,
+          `- 模型: ${params.model ?? defaultModel}`,
           `- 画面比例: ${intent === 'video_gen' && selectedVideoInputMode ? videoAspectRatioLabel(params.aspect_ratio, selectedVideoInputMode) : params.aspect_ratio}`,
           ...(params.duration ? [`- 时长: ${params.duration} 秒`] : []),
           ...(intent === 'video_gen' && videoCapability ? [`- 分辨率: ${params.resolution ?? videoCapability.defaultResolution}`] : []),
@@ -909,7 +911,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         ]
         if (params.skipFinalConfirmation === true) finalConfirmed = true
         else {
-          const finalAnswers = await ask(ctx, exec, [{ id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: parameterLines.join('\n'), options: [{ label: '确认生成（推荐）' }, { label: '取消' }] }])
+          const finalAnswers = await ask(ctx, exec, [{ id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: parameterLines.join('\n'), options: [{ label: '确认生成' }, { label: '取消' }] }])
           finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === '确认生成'
         }
         return result()

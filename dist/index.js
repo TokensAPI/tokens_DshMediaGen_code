@@ -253,6 +253,177 @@ async function saveVideo(url, taskId, config, signal) {
 // src/host/tokensapi.ts
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { createHash, createHmac } from "node:crypto";
+
+// src/host/image-upload.ts
+var SUPPORTED_IMAGE_MIME_TYPES = /* @__PURE__ */ new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif"
+]);
+var MAX_IMAGE_BYTES = 30 * 1024 * 1024;
+var FORBIDDEN_UPLOAD_HEADERS = /* @__PURE__ */ new Set([
+  "authorization",
+  "cookie",
+  "host",
+  "proxy-authorization"
+]);
+function objectValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function apiErrorMessage(payload) {
+  if (typeof payload.message === "string" && payload.message.trim()) return payload.message.trim();
+  const error = objectValue(payload.error);
+  if (typeof error?.message === "string" && error.message.trim()) {
+    const code = typeof error.code === "string" && error.code.trim() ? `${error.code.trim()}: ` : "";
+    return `${code}${error.message.trim()}`;
+  }
+  return void 0;
+}
+function uploadPayload(payload) {
+  if ("upload_url" in payload || "access_url" in payload || "required_headers" in payload) {
+    return { protocol: "assets-v1", value: payload };
+  }
+  const legacy = objectValue(payload.data);
+  if (payload.success === true && legacy) return { protocol: "legacy-presign", value: legacy };
+  const detail = apiErrorMessage(payload);
+  throw new Error(`TokensAPI image upload response is invalid${detail ? `: ${detail}` : "."}`);
+}
+function requiredString(value, field) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`TokensAPI image upload response is missing ${field}.`);
+  }
+  return value.trim();
+}
+function uploadHeaders(value, protocol) {
+  if (value === void 0 && protocol === "legacy-presign") return {};
+  const record = objectValue(value);
+  if (!record) throw new Error("TokensAPI image upload response has invalid required_headers.");
+  const entries = Object.entries(record);
+  if (entries.some(([name2, headerValue]) => !name2.trim() || typeof headerValue !== "string")) {
+    throw new Error("TokensAPI image upload response has invalid required_headers.");
+  }
+  return Object.fromEntries(entries.map(([name2, headerValue]) => [name2, String(headerValue)]));
+}
+function uploadExpiry(value) {
+  if (value === void 0) return void 0;
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new Error("TokensAPI image upload response has invalid upload_expires_at.");
+  }
+  return value;
+}
+function parseImageUploadGrant(payload) {
+  const root = objectValue(payload);
+  if (!root) throw new Error("TokensAPI image upload response is invalid.");
+  const parsed = uploadPayload(root);
+  return {
+    uploadUrl: requiredString(parsed.value.upload_url, "upload_url"),
+    accessUrl: requiredString(parsed.value.access_url, "access_url"),
+    uploadMethod: parsed.protocol === "legacy-presign" ? typeof parsed.value.upload_method === "string" && parsed.value.upload_method.trim() ? parsed.value.upload_method.trim() : "PUT" : requiredString(parsed.value.upload_method, "upload_method"),
+    requiredHeaders: uploadHeaders(parsed.value.required_headers, parsed.protocol),
+    uploadExpiresAt: uploadExpiry(parsed.value.upload_expires_at),
+    protocol: parsed.protocol
+  };
+}
+function validateHttpsUrl(value, field) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`TokensAPI image upload response has invalid ${field}.`);
+  }
+  if (url.protocol !== "https:" || !url.hostname) {
+    throw new Error(`TokensAPI image upload response ${field} must use HTTPS.`);
+  }
+  if (url.username || url.password) {
+    throw new Error(`TokensAPI image upload response ${field} must not contain credentials.`);
+  }
+}
+function validateLocalImage(mimeType, byteLength) {
+  const normalizedMimeType = mimeType.trim().toLowerCase();
+  if (!SUPPORTED_IMAGE_MIME_TYPES.has(normalizedMimeType)) {
+    throw new Error(`TokensAPI image upload does not support ${mimeType || "an empty MIME type"}.`);
+  }
+  if (!Number.isSafeInteger(byteLength) || byteLength < 1 || byteLength > MAX_IMAGE_BYTES) {
+    throw new Error(`TokensAPI image upload size must be between 1 and ${MAX_IMAGE_BYTES} bytes.`);
+  }
+  return normalizedMimeType;
+}
+function validatedHeaders(headers) {
+  const result = {};
+  const byLowerName = /* @__PURE__ */ new Map();
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name2 = rawName.trim();
+    const lowerName = name2.toLowerCase();
+    if (!name2 || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name2) || /[\r\n]/.test(rawValue)) {
+      throw new Error("TokensAPI image upload response contains an invalid required header.");
+    }
+    if (byLowerName.has(lowerName)) {
+      throw new Error(`TokensAPI image upload response contains duplicate required header ${name2}.`);
+    }
+    if (FORBIDDEN_UPLOAD_HEADERS.has(lowerName)) {
+      throw new Error(`TokensAPI image upload response must not require sensitive header ${name2}.`);
+    }
+    byLowerName.set(lowerName, rawValue);
+    result[name2] = rawValue;
+  }
+  return { headers: result, byLowerName };
+}
+function validateContentLength(value, byteLength, required) {
+  if (value === void 0) {
+    if (required) throw new Error("TokensAPI image upload response is missing required Content-Length.");
+    return;
+  }
+  const trimmed = value.trim();
+  if (!/^(?:0|[1-9]\d*)$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed))) {
+    throw new Error("TokensAPI image upload response has invalid Content-Length.");
+  }
+  if (Number(trimmed) !== byteLength) {
+    throw new Error(`Signed Content-Length ${trimmed} does not match the local image size ${byteLength}.`);
+  }
+}
+function validateContentType(value, mimeType, required) {
+  if (value === void 0) {
+    if (required) throw new Error("TokensAPI image upload response is missing required Content-Type.");
+    return;
+  }
+  if (value.trim().toLowerCase() !== mimeType) {
+    throw new Error(`Signed Content-Type ${value.trim() || "(empty)"} does not match the local image type ${mimeType}.`);
+  }
+}
+function validateExpiry(grant, nowSeconds, minimumValiditySeconds) {
+  if (grant.uploadExpiresAt === void 0) return;
+  if (grant.uploadExpiresAt <= nowSeconds) {
+    throw new Error("TokensAPI image upload URL has expired.");
+  }
+  if (grant.uploadExpiresAt - nowSeconds < minimumValiditySeconds) {
+    throw new Error("TokensAPI image upload URL expires too soon to start the upload safely.");
+  }
+}
+function validateImageUploadGrant(grant, options) {
+  const mimeType = validateLocalImage(options.mimeType, options.byteLength);
+  validateHttpsUrl(grant.uploadUrl, "upload_url");
+  validateHttpsUrl(grant.accessUrl, "access_url");
+  if (grant.uploadMethod !== "PUT") {
+    throw new Error(`TokensAPI image upload method must be PUT, received ${grant.uploadMethod || "(empty)"}.`);
+  }
+  const checked = validatedHeaders(grant.requiredHeaders);
+  const strict = grant.protocol === "assets-v1";
+  validateContentLength(checked.byLowerName.get("content-length"), options.byteLength, strict);
+  validateContentType(checked.byLowerName.get("content-type"), mimeType, strict);
+  validateExpiry(
+    grant,
+    options.nowSeconds ?? Math.floor(Date.now() / 1e3),
+    options.minimumValiditySeconds ?? 5
+  );
+  if (!strict && !checked.byLowerName.has("content-type")) checked.headers["Content-Type"] = mimeType;
+  return {
+    ...grant,
+    requiredHeaders: checked.headers
+  };
+}
+
+// src/host/tokensapi.ts
 var TokensApiHttpError = class extends Error {
   constructor(message, status, retryAfterMs) {
     super(message);
@@ -292,6 +463,33 @@ function responseErrorMessage(data, fallback) {
     return String(error.message);
   }
   return fallback;
+}
+function responseErrorCode(data) {
+  if (typeof data.code === "string" && data.code.trim()) return data.code.trim();
+  const error = data.error;
+  if (error && typeof error === "object" && typeof error.code === "string") {
+    const code = String(error.code).trim();
+    return code || void 0;
+  }
+  return void 0;
+}
+function imageUploadSigningError(response, data) {
+  const explanations = {
+    400: "The image upload signing request is invalid.",
+    401: "The configured TokensAPI API key is invalid or missing.",
+    403: "Image upload is not allowed for this user, organization, or IP.",
+    413: "The image exceeds the 30 MB upload limit.",
+    429: "Image upload signing was requested too frequently; wait before retrying.",
+    503: "TokensAPI image storage is unavailable."
+  };
+  const explanation = explanations[response.status] ?? "TokensAPI could not create an image upload URL.";
+  const code = responseErrorCode(data);
+  const serviceDetail = responseErrorMessage(data, response.statusText).trim();
+  const suffix = [
+    code ? `code=${code}` : "",
+    serviceDetail && serviceDetail !== response.statusText ? serviceDetail : ""
+  ].filter(Boolean).join("; ");
+  return new Error(`TokensAPI image upload signing failed (${response.status}): ${explanation}${suffix ? ` ${suffix}` : ""}`);
 }
 function responseRetryAfterMs(response) {
   const value = response.headers.get("retry-after")?.trim();
@@ -389,7 +587,7 @@ ${canonicalJson(body)}`);
   }
   async uploadImage(dataUrl, signal) {
     if (this.config.storageBackend === "r2") return this.uploadImageR2(dataUrl, signal);
-    if (!this.config.imageUploadURL) throw new Error("TokensAPI presign URL is not configured.");
+    if (!this.config.imageUploadURL) throw new Error("TokensAPI image upload URL is not configured.");
     if (this.config.uploadAuthMode === "account" && !this.config.accountUserId.trim()) {
       throw new Error("accountUserId is required for account-authenticated TokensAPI image upload.");
     }
@@ -397,7 +595,7 @@ ${canonicalJson(body)}`);
     if (!match) throw new Error("First-party image upload requires a base64 Data URL.");
     const mediaType = match[1] ?? "image/png";
     if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mediaType)) {
-      throw new Error(`TokensAPI presign does not support ${mediaType}.`);
+      throw new Error(`TokensAPI image upload does not support ${mediaType}.`);
     }
     const bytes = Buffer.from(match[2] ?? "", "base64");
     if (bytes.length === 0 || bytes.length > 30 * 1024 * 1024) throw new Error("TokensAPI image upload size must be between 1 byte and 30 MB.");
@@ -414,26 +612,22 @@ ${canonicalJson(body)}`);
       signal
     });
     const presign = await presignResponse.json().catch(() => ({}));
-    if (!presignResponse.ok || presign.success !== true) {
-      const detail = presign.message ?? presignResponse.statusText;
-      if (this.config.uploadAuthMode === "api_key" && /unauthorized|invalid access token/i.test(detail)) {
-        throw new Error("TokensAPI presign rejected the configured API key. Production /api/aigc/presign currently requires an account access token and New-Api-User, or the server must enable TokenOrUserAuth for this route.");
-      }
-      throw new Error(`TokensAPI presign failed (${presignResponse.status}): ${detail}`);
+    if (!presignResponse.ok) {
+      throw imageUploadSigningError(presignResponse, presign);
     }
-    const uploadUrl = presign.data?.upload_url;
-    const accessUrl = presign.data?.access_url;
-    if (!uploadUrl || !/^https:\/\//i.test(uploadUrl) || !accessUrl || !/^https:\/\//i.test(accessUrl)) {
-      throw new Error("TokensAPI presign returned invalid upload_url or access_url.");
-    }
-    const uploadResponse = await fetch(uploadUrl, {
-      method: "PUT",
-      headers: { "Content-Type": mediaType },
+    const grant = validateImageUploadGrant(parseImageUploadGrant(presign), {
+      mimeType: mediaType,
+      byteLength: bytes.length
+    });
+    const uploadResponse = await fetch(grant.uploadUrl, {
+      method: grant.uploadMethod,
+      headers: grant.requiredHeaders,
       body: bytes,
+      redirect: "error",
       signal
     });
     if (!uploadResponse.ok) throw new Error(`TokensAPI object upload failed (${uploadResponse.status}): ${uploadResponse.statusText}`);
-    return accessUrl;
+    return grant.accessUrl;
   }
   async uploadImageR2(dataUrl, signal) {
     const requiredFields = ["r2Endpoint", "r2Bucket", "r2CdnBase"];
@@ -647,7 +841,7 @@ var Config = Schema.object({
   maxPollMs: Schema.number().default(12 * 60 * 1e3),
   defaultImageModel: Schema.union([...IMAGE_MODELS]).default("z_image_turbo"),
   defaultEditModel: Schema.union([...IMAGE_EDIT_MODELS]).default("qwen_image"),
-  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default("ltx_2_5"),
+  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default("minimax_h3"),
   enhanceEnabled: Schema.boolean().default(true),
   enhanceApiKeyEnv: Schema.string().role("credential-ref").default("TOKENSAPI_API_KEY"),
   enhanceBaseURL: Schema.string().default("https://tokensapi.ai/v1"),
@@ -655,8 +849,8 @@ var Config = Schema.object({
   enhanceMaxChars: Schema.number().default(4e3),
   allowLocalImageInput: Schema.boolean().default(true),
   maxInputImageBytes: Schema.number().default(30 * 1024 * 1024),
-  imageUploadURL: Schema.string().default("https://tokensapi.ai/api/aigc/presign"),
-  uploadAuthMode: Schema.union(["account", "api_key"]).default("account"),
+  imageUploadURL: Schema.string().default("https://tokensapi.ai/v1/assets/images"),
+  uploadAuthMode: Schema.union(["account", "api_key"]).default("api_key"),
   accountAccessTokenEnv: Schema.string().role("credential-ref").default("TOKENSAPI_ACCOUNT_ACCESS_TOKEN"),
   accountUserId: Schema.string().default(""),
   storageBackend: Schema.union(["presign", "r2"]).default("presign"),
@@ -1340,7 +1534,7 @@ ${JSON.stringify(value.params, null, 2)}`
         if (intent === "video_gen") {
           const hasInput = params.image_url || params.start_image || params.end_image || Array.isArray(params.reference_images) && params.reference_images.length;
           if (!hasInput && !params.prompt) {
-            const answers = await ask(ctx, exec, [{ id: "video_input", header: "\u89C6\u9891\u7C7B\u578B", question: "\u9009\u62E9\u89C6\u9891\u751F\u6210\u65B9\u5F0F", options: [{ label: "\u7EAF\u6587\u751F\u89C6\u9891\uFF08\u63A8\u8350\uFF09" }, { label: "\u4F7F\u7528\u9996\u5E27\u56FE\u7247" }, { label: "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247" }] }]);
+            const answers = await ask(ctx, exec, [{ id: "video_input", header: "\u89C6\u9891\u7C7B\u578B", question: "\u9009\u62E9\u89C6\u9891\u751F\u6210\u65B9\u5F0F", options: [{ label: "\u7EAF\u6587\u751F\u89C6\u9891" }, { label: "\u4F7F\u7528\u9996\u5E27\u56FE\u7247" }, { label: "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247" }] }]);
             const choice = stripRecommended(selected(answers.video_input));
             if (!choice) return result();
             if (choice === "\u4F7F\u7528\u9996\u5E27\u56FE\u7247") {
@@ -1381,7 +1575,7 @@ ${JSON.stringify(value.params, null, 2)}`
           params.enhanced = enhanced !== original;
         }
         if (params.enhanced === void 0) {
-          const enhanceOptions = config.enhanceEnabled ? [{ label: "\u589E\u5F3A Prompt\uFF08\u63A8\u8350\uFF09", description: "\u4F18\u5316\u89C6\u89C9\u3001\u955C\u5934\u548C\u8D28\u91CF\u7EC6\u8282" }, { label: "\u4FDD\u6301\u539F\u59CB Prompt", description: "\u4E0D\u4FEE\u6539\u5185\u5BB9\u63CF\u8FF0" }] : [{ label: "\u4FDD\u6301\u539F\u59CB Prompt\uFF08\u63A8\u8350\uFF09", description: "\u5F53\u524D\u672A\u542F\u7528\u63D0\u793A\u8BCD\u589E\u5F3A\u670D\u52A1" }];
+          const enhanceOptions = config.enhanceEnabled ? [{ label: "\u589E\u5F3A Prompt", description: "\u4F18\u5316\u89C6\u89C9\u3001\u955C\u5934\u548C\u8D28\u91CF\u7EC6\u8282" }, { label: "\u4FDD\u6301\u539F\u59CB Prompt", description: "\u4E0D\u4FEE\u6539\u5185\u5BB9\u63CF\u8FF0" }] : [{ label: "\u4FDD\u6301\u539F\u59CB Prompt", description: "\u5F53\u524D\u672A\u542F\u7528\u63D0\u793A\u8BCD\u589E\u5F3A\u670D\u52A1" }];
           const answers = await ask(ctx, exec, [{
             id: "enhance",
             header: "Prompt \u589E\u5F3A",
@@ -1408,7 +1602,7 @@ ${params.prompt}`,
 ${params.originalPrompt}
 
 \u589E\u5F3A\u540E Prompt:
-${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt\uFF08\u63A8\u8350\uFF09" }, { label: "\u53D6\u6D88" }] }]);
+${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" }, { label: "\u53D6\u6D88" }] }]);
           promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === "\u786E\u8BA4\u589E\u5F3A\u540E Prompt";
         } else promptConfirmed = Boolean(params.prompt);
         if (!promptConfirmed) return result();
@@ -1452,16 +1646,16 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt\uFF
           if (videoCapability.audioMode === "required" && params.generate_audio === void 0) params.generate_audio = true;
         }
         const outputQuestions = [];
-        if (intent === "image_gen" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio === "1:1" ? `${ratio}\uFF08\u63A8\u8350\uFF09` : ratio })) });
-        if (intent === "image_edit" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: ASPECT_RATIOS.map((ratio, index) => ({ label: index === 0 ? `${ratio}\uFF08\u63A8\u8350\uFF09` : ratio })) });
+        if (intent === "image_gen" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio })) });
+        if (intent === "image_edit" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: ASPECT_RATIOS.map((ratio) => ({ label: ratio })) });
         if (intent === "video_gen" && videoCapability && selectedVideoInputMode && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: videoCapability.aspectRatios.map((ratio) => {
           const label = videoAspectRatioLabel(ratio, selectedVideoInputMode);
-          return { label: ratio === videoCapability.defaultAspectRatio ? `${label}\uFF08\u63A8\u8350\uFF09` : label };
+          return { label };
         }) });
-        if (intent === "video_gen" && videoCapability && !params.duration) outputQuestions.push({ id: "duration", header: "\u65F6\u957F", question: "\u9009\u62E9\u89C6\u9891\u65F6\u957F", options: videoCapability.durations.map((duration) => ({ label: duration === videoCapability.defaultDuration ? `${duration} \u79D2\uFF08\u63A8\u8350\uFF09` : `${duration} \u79D2` })) });
-        if (intent === "video_gen" && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: "resolution", header: "\u5206\u8FA8\u7387", question: "\u9009\u62E9\u89C6\u9891\u5206\u8FA8\u7387", options: videoCapability.resolutions.map((resolution) => ({ label: resolution === videoCapability.defaultResolution ? `${resolution}\uFF08\u63A8\u8350\uFF09` : resolution })) });
-        if (intent === "video_gen" && videoCapability?.audioMode === "optional" && params.generate_audio === void 0) outputQuestions.push({ id: "generate_audio", header: "\u751F\u6210\u97F3\u9891", question: "\u662F\u5426\u751F\u6210\u89C6\u9891\u97F3\u9891\uFF1F", options: [{ label: "\u5F00\u542F\u97F3\u9891\uFF08\u63A8\u8350\uFF09", description: "\u89C6\u9891\u5C06\u5305\u542B\u6A21\u578B\u751F\u6210\u7684\u97F3\u9891" }, { label: "\u5173\u95ED\u97F3\u9891", description: "\u751F\u6210\u65E0\u97F3\u9891\u89C6\u9891" }] });
-        if ((intent === "image_gen" || intent === "image_edit") && !params.n) outputQuestions.push({ id: "n", header: "\u6570\u91CF", question: "\u751F\u6210\u51E0\u5F20\uFF1F", options: [{ label: "1 \u5F20\uFF08\u63A8\u8350\uFF09" }, { label: "2 \u5F20" }, { label: "4 \u5F20" }] });
+        if (intent === "video_gen" && videoCapability && !params.duration) outputQuestions.push({ id: "duration", header: "\u65F6\u957F", question: "\u9009\u62E9\u89C6\u9891\u65F6\u957F", options: videoCapability.durations.map((duration) => ({ label: `${duration} \u79D2` })) });
+        if (intent === "video_gen" && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: "resolution", header: "\u5206\u8FA8\u7387", question: "\u9009\u62E9\u89C6\u9891\u5206\u8FA8\u7387", options: videoCapability.resolutions.map((resolution) => ({ label: resolution })) });
+        if (intent === "video_gen" && videoCapability?.audioMode === "optional" && params.generate_audio === void 0) outputQuestions.push({ id: "generate_audio", header: "\u751F\u6210\u97F3\u9891", question: "\u662F\u5426\u751F\u6210\u89C6\u9891\u97F3\u9891\uFF1F", options: [{ label: "\u5F00\u542F\u97F3\u9891", description: "\u89C6\u9891\u5C06\u5305\u542B\u6A21\u578B\u751F\u6210\u7684\u97F3\u9891" }, { label: "\u5173\u95ED\u97F3\u9891", description: "\u751F\u6210\u65E0\u97F3\u9891\u89C6\u9891" }] });
+        if ((intent === "image_gen" || intent === "image_edit") && !params.n) outputQuestions.push({ id: "n", header: "\u6570\u91CF", question: "\u751F\u6210\u51E0\u5F20\uFF1F", options: [{ label: "1 \u5F20" }, { label: "2 \u5F20" }, { label: "4 \u5F20" }] });
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions);
           if (answers.aspect_ratio) params.aspect_ratio = intent === "video_gen" ? parseVideoAspectRatioLabel(selected(answers.aspect_ratio)) : stripRecommended(selected(answers.aspect_ratio));
@@ -1486,7 +1680,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt\uFF
           `- \u5185\u5BB9: ${params.prompt}`,
           `- Prompt \u6765\u6E90: ${params.promptSource ?? (promptProvidedBeforeWizard ? "user" : "wizard")}`,
           `- Prompt \u589E\u5F3A: ${promptWasEnhanced ? "\u5DF2\u589E\u5F3A" : "\u672A\u589E\u5F3A"}`,
-          `- \u6A21\u578B: ${params.model ?? `${defaultModel}\uFF08\u63A8\u8350\uFF09`}`,
+          `- \u6A21\u578B: ${params.model ?? defaultModel}`,
           `- \u753B\u9762\u6BD4\u4F8B: ${intent === "video_gen" && selectedVideoInputMode ? videoAspectRatioLabel(params.aspect_ratio, selectedVideoInputMode) : params.aspect_ratio}`,
           ...params.duration ? [`- \u65F6\u957F: ${params.duration} \u79D2`] : [],
           ...intent === "video_gen" && videoCapability ? [`- \u5206\u8FA8\u7387: ${params.resolution ?? videoCapability.defaultResolution}`] : [],
@@ -1495,7 +1689,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt\uFF
         ];
         if (params.skipFinalConfirmation === true) finalConfirmed = true;
         else {
-          const finalAnswers = await ask(ctx, exec, [{ id: "final_confirm", header: "\u6700\u7EC8\u786E\u8BA4", question: "\u6309\u4EE5\u4E0B\u5B8C\u6574\u914D\u7F6E\u521B\u5EFA\u4EFB\u52A1\u5417\uFF1F", detail: parameterLines.join("\n"), options: [{ label: "\u786E\u8BA4\u751F\u6210\uFF08\u63A8\u8350\uFF09" }, { label: "\u53D6\u6D88" }] }]);
+          const finalAnswers = await ask(ctx, exec, [{ id: "final_confirm", header: "\u6700\u7EC8\u786E\u8BA4", question: "\u6309\u4EE5\u4E0B\u5B8C\u6574\u914D\u7F6E\u521B\u5EFA\u4EFB\u52A1\u5417\uFF1F", detail: parameterLines.join("\n"), options: [{ label: "\u786E\u8BA4\u751F\u6210" }, { label: "\u53D6\u6D88" }] }]);
           finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === "\u786E\u8BA4\u751F\u6210";
         }
         return result();
@@ -1768,6 +1962,8 @@ export {
   inject,
   isVideoModel,
   name,
+  parseImageUploadGrant,
+  validateImageUploadGrant,
   videoModelCapability
 };
 //# sourceMappingURL=index.js.map

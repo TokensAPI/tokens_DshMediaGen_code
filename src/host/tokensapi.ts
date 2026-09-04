@@ -2,6 +2,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { createHash, createHmac } from 'node:crypto'
 import type { MediaConfig } from './types.js'
 import { extensionForMediaType, resultUrls } from '../shared/media.js'
+import { parseImageUploadGrant, validateImageUploadGrant } from './image-upload.js'
 
 type MediaTaskKind = 'images' | 'videos'
 
@@ -64,6 +65,35 @@ function responseErrorMessage(data: Record<string, unknown>, fallback: string): 
     return String((error as { message: string }).message)
   }
   return fallback
+}
+
+function responseErrorCode(data: Record<string, unknown>): string | undefined {
+  if (typeof data.code === 'string' && data.code.trim()) return data.code.trim()
+  const error = data.error
+  if (error && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string') {
+    const code = String((error as { code: string }).code).trim()
+    return code || undefined
+  }
+  return undefined
+}
+
+function imageUploadSigningError(response: Response, data: Record<string, unknown>): Error {
+  const explanations: Record<number, string> = {
+    400: 'The image upload signing request is invalid.',
+    401: 'The configured TokensAPI API key is invalid or missing.',
+    403: 'Image upload is not allowed for this user, organization, or IP.',
+    413: 'The image exceeds the 30 MB upload limit.',
+    429: 'Image upload signing was requested too frequently; wait before retrying.',
+    503: 'TokensAPI image storage is unavailable.',
+  }
+  const explanation = explanations[response.status] ?? 'TokensAPI could not create an image upload URL.'
+  const code = responseErrorCode(data)
+  const serviceDetail = responseErrorMessage(data, response.statusText).trim()
+  const suffix = [
+    code ? `code=${code}` : '',
+    serviceDetail && serviceDetail !== response.statusText ? serviceDetail : '',
+  ].filter(Boolean).join('; ')
+  return new Error(`TokensAPI image upload signing failed (${response.status}): ${explanation}${suffix ? ` ${suffix}` : ''}`)
 }
 
 function responseRetryAfterMs(response: Response): number | undefined {
@@ -180,7 +210,7 @@ export class TokensApiClient {
 
   async uploadImage(dataUrl: string, signal?: AbortSignal): Promise<string> {
     if (this.config.storageBackend === 'r2') return this.uploadImageR2(dataUrl, signal)
-    if (!this.config.imageUploadURL) throw new Error('TokensAPI presign URL is not configured.')
+    if (!this.config.imageUploadURL) throw new Error('TokensAPI image upload URL is not configured.')
     if (this.config.uploadAuthMode === 'account' && !this.config.accountUserId.trim()) {
       throw new Error('accountUserId is required for account-authenticated TokensAPI image upload.')
     }
@@ -188,7 +218,7 @@ export class TokensApiClient {
     if (!match) throw new Error('First-party image upload requires a base64 Data URL.')
     const mediaType = match[1] ?? 'image/png'
     if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mediaType)) {
-      throw new Error(`TokensAPI presign does not support ${mediaType}.`)
+      throw new Error(`TokensAPI image upload does not support ${mediaType}.`)
     }
     const bytes = Buffer.from(match[2] ?? '', 'base64')
     if (bytes.length === 0 || bytes.length > 30 * 1024 * 1024) throw new Error('TokensAPI image upload size must be between 1 byte and 30 MB.')
@@ -206,31 +236,23 @@ export class TokensApiClient {
       body: JSON.stringify({ mime_type: mediaType, file_size: bytes.length }),
       signal,
     })
-    const presign = await presignResponse.json().catch(() => ({})) as {
-      success?: boolean
-      message?: string
-      data?: { upload_url?: string; access_url?: string }
+    const presign = await presignResponse.json().catch(() => ({})) as Record<string, unknown>
+    if (!presignResponse.ok) {
+      throw imageUploadSigningError(presignResponse, presign)
     }
-    if (!presignResponse.ok || presign.success !== true) {
-      const detail = presign.message ?? presignResponse.statusText
-      if (this.config.uploadAuthMode === 'api_key' && /unauthorized|invalid access token/i.test(detail)) {
-        throw new Error('TokensAPI presign rejected the configured API key. Production /api/aigc/presign currently requires an account access token and New-Api-User, or the server must enable TokenOrUserAuth for this route.')
-      }
-      throw new Error(`TokensAPI presign failed (${presignResponse.status}): ${detail}`)
-    }
-    const uploadUrl = presign.data?.upload_url
-    const accessUrl = presign.data?.access_url
-    if (!uploadUrl || !/^https:\/\//i.test(uploadUrl) || !accessUrl || !/^https:\/\//i.test(accessUrl)) {
-      throw new Error('TokensAPI presign returned invalid upload_url or access_url.')
-    }
-    const uploadResponse = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': mediaType },
+    const grant = validateImageUploadGrant(parseImageUploadGrant(presign), {
+      mimeType: mediaType,
+      byteLength: bytes.length,
+    })
+    const uploadResponse = await fetch(grant.uploadUrl, {
+      method: grant.uploadMethod,
+      headers: grant.requiredHeaders,
       body: bytes,
+      redirect: 'error',
       signal,
     })
     if (!uploadResponse.ok) throw new Error(`TokensAPI object upload failed (${uploadResponse.status}): ${uploadResponse.statusText}`)
-    return accessUrl
+    return grant.accessUrl
   }
 
   private async uploadImageR2(dataUrl: string, signal?: AbortSignal): Promise<string> {

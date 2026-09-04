@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.5
+
+- Limited the `（推荐）` marker to the default model in model-selection questions, changed the default recommended video model to `minimax_h3`, and left all other wizard choices and the final summary unmarked.
+- Switched the default first-party image upload endpoint to `POST /v1/assets/images` with the existing `TOKENSAPI_API_KEY`.
+- Added strict parsing and validation for `upload_url`, `access_url`, `upload_method`, `required_headers`, and `upload_expires_at` while retaining the legacy `{ success, data }` response as an explicit compatibility path.
+- Moved the complete S3 upload operation into the Host with raw image bytes, exact signed headers, disabled redirects, and acceptance of any successful HTTP 2xx response.
+- Added safeguards for HTTPS URLs, signed content length/type, expiry margin, duplicate or malformed headers, and sensitive identity headers that must never be forwarded to S3.
+- Added clear signing failures for HTTP 400/401/403/413/429/503 and prevented invalid grants or failed object uploads from reaching media task submission.
+- Added parser, validation, Host upload, API-key isolation, legacy-account compatibility, and failure-path tests without making real TokensAPI, S3, or paid generation requests.
+
 ## 0.3.4
 
 - Added an explicit context-reuse consent gate for prior Prompt, reference images or frame inputs, and generation settings.
