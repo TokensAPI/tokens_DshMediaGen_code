@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.6
+
+- Add one valid `initialSelected` value to every wizard question with options so compatible TokensCowork clients can render a default selected state without adding recommendation badges.
+- Use safe or capability-defined defaults for reuse decisions, media settings, audio, quantity, and confirmation steps.
+- Default historical-context questions to reuse, while keeping Prompt enhancement selected when enhancement is available.
+- Give image downloads collision-resistant names containing the image index, local timestamp, and task-ID suffix.
+- Require confirmed image and video output parameters at the final tool boundary, preventing missing wizard values from silently submitting tasks with different defaults.
+
 ## 0.3.5
 
 - Limited the `（推荐）` marker to the default model in model-selection questions, changed the default recommended video model to `minimax_h3`, and left all other wizard choices and the final summary unmarked.

@@ -1390,7 +1390,7 @@ Known-field contract: prompt is the current requested content or edit; promptSou
 
 Reuse contract: previousTask contains only the most recent completed same-intent task and its final params. reuse contains explicit per-category decisions only when the user already said whether to reuse prompt, references, or settings. Use true for explicit reuse and false for explicit reset. Leave a category absent when the request is ambiguous, such as "generate another video", so the wizard asks. Phrases such as "another identical one" can set all available categories true; "do not reuse anything" can set them false; "change the content but keep other settings" should set prompt false and settings true. Current known values always win over reused values.
 
-The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice. For video generation, pass the wizard's generate_audio value to media_generate_video when present.
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
 
 Submission safety contract: a network error, HTTP 429, unchanged progress, or a timed-out foreground wait does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, or says the submission status is uncertain, do not call a media_generate_* tool again for that request. Continue with media_task_status when a taskId is known. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`
   });
@@ -1470,7 +1470,8 @@ ${JSON.stringify(value.params, null, 2)}`
           header: "\u5386\u53F2 Prompt",
           question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684 Prompt\uFF1F",
           detail: `\u4E0A\u6B21 Prompt\uFF1A${truncatedPrompt(reusablePrompt.prompt)}`,
-          options: [{ label: "\u4E0D\u590D\u7528", description: "\u6309\u672C\u6B21\u65B0\u4EFB\u52A1\u91CD\u65B0\u586B\u5199 Prompt" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684 Prompt" }]
+          options: [{ label: "\u4E0D\u590D\u7528", description: "\u6309\u672C\u6B21\u65B0\u4EFB\u52A1\u91CD\u65B0\u586B\u5199 Prompt" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684 Prompt" }],
+          initialSelected: ["\u590D\u7528"]
         });
       }
       if (Object.keys(reusableReferences).length && reuseDecisions.references === void 0) {
@@ -1479,7 +1480,8 @@ ${JSON.stringify(value.params, null, 2)}`
           header: "\u5386\u53F2\u53C2\u8003\u7D20\u6750",
           question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u53C2\u8003\u56FE\u6216\u9996\u5C3E\u5E27\uFF1F",
           detail: reusableReferenceDetail(intent, reusableReferences),
-          options: [{ label: "\u4E0D\u590D\u7528", description: "\u672C\u6B21\u4E0D\u4F7F\u7528\u5386\u53F2\u53C2\u8003\u7D20\u6750" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u53C2\u8003\u7D20\u6750" }]
+          options: [{ label: "\u4E0D\u590D\u7528", description: "\u672C\u6B21\u4E0D\u4F7F\u7528\u5386\u53F2\u53C2\u8003\u7D20\u6750" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u53C2\u8003\u7D20\u6750" }],
+          initialSelected: ["\u590D\u7528"]
         });
       }
       if (Object.keys(reusableSettings).length && reuseDecisions.settings === void 0) {
@@ -1488,7 +1490,8 @@ ${JSON.stringify(value.params, null, 2)}`
           header: "\u5386\u53F2\u751F\u6210\u53C2\u6570",
           question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u751F\u6210\u53C2\u6570\uFF1F",
           detail: reusableSettingsDetail(reusableSettings),
-          options: [{ label: "\u4E0D\u590D\u7528", description: "\u91CD\u65B0\u9009\u62E9\u6A21\u578B\u548C\u8F93\u51FA\u53C2\u6570" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u53EF\u517C\u5BB9\u7684\u6A21\u578B\u548C\u8F93\u51FA\u53C2\u6570" }]
+          options: [{ label: "\u4E0D\u590D\u7528", description: "\u91CD\u65B0\u9009\u62E9\u6A21\u578B\u548C\u8F93\u51FA\u53C2\u6570" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u53EF\u517C\u5BB9\u7684\u6A21\u578B\u548C\u8F93\u51FA\u53C2\u6570" }],
+          initialSelected: ["\u590D\u7528"]
         });
       }
       if (reuseQuestions.length) {
@@ -1534,7 +1537,7 @@ ${JSON.stringify(value.params, null, 2)}`
         if (intent === "video_gen") {
           const hasInput = params.image_url || params.start_image || params.end_image || Array.isArray(params.reference_images) && params.reference_images.length;
           if (!hasInput && !params.prompt) {
-            const answers = await ask(ctx, exec, [{ id: "video_input", header: "\u89C6\u9891\u7C7B\u578B", question: "\u9009\u62E9\u89C6\u9891\u751F\u6210\u65B9\u5F0F", options: [{ label: "\u7EAF\u6587\u751F\u89C6\u9891" }, { label: "\u4F7F\u7528\u9996\u5E27\u56FE\u7247" }, { label: "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247" }] }]);
+            const answers = await ask(ctx, exec, [{ id: "video_input", header: "\u89C6\u9891\u7C7B\u578B", question: "\u9009\u62E9\u89C6\u9891\u751F\u6210\u65B9\u5F0F", options: [{ label: "\u7EAF\u6587\u751F\u89C6\u9891" }, { label: "\u4F7F\u7528\u9996\u5E27\u56FE\u7247" }, { label: "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247" }], initialSelected: ["\u7EAF\u6587\u751F\u89C6\u9891"] }]);
             const choice = stripRecommended(selected(answers.video_input));
             if (!choice) return result();
             if (choice === "\u4F7F\u7528\u9996\u5E27\u56FE\u7247") {
@@ -1584,7 +1587,8 @@ ${JSON.stringify(value.params, null, 2)}`
 \u6765\u6E90\uFF1A${promptSourceDescription(params.promptSource)}
 
 ${params.prompt}`,
-            options: enhanceOptions
+            options: enhanceOptions,
+            initialSelected: [config.enhanceEnabled ? "\u589E\u5F3A Prompt" : "\u4FDD\u6301\u539F\u59CB Prompt"]
           }]);
           const choice = stripRecommended(selected(answers.enhance));
           if (!choice) return result();
@@ -1602,7 +1606,7 @@ ${params.prompt}`,
 ${params.originalPrompt}
 
 \u589E\u5F3A\u540E Prompt:
-${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" }, { label: "\u53D6\u6D88" }] }]);
+${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" }, { label: "\u53D6\u6D88" }], initialSelected: ["\u786E\u8BA4\u589E\u5F3A\u540E Prompt"] }]);
           promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === "\u786E\u8BA4\u589E\u5F3A\u540E Prompt";
         } else promptConfirmed = Boolean(params.prompt);
         if (!promptConfirmed) return result();
@@ -1622,7 +1626,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
             label: model === defaultModel ? defaultModelLabel : model,
             ...intent === "video_gen" ? { description: `${model === defaultModel ? "\u4F7F\u7528\u63D2\u4EF6\u5F53\u524D\u914D\u7F6E\u7684\u9ED8\u8BA4\u6A21\u578B\uFF1B" : ""}${videoModelDescription(model)}` } : model === defaultModel ? { description: "\u4F7F\u7528\u63D2\u4EF6\u5F53\u524D\u914D\u7F6E\u7684\u9ED8\u8BA4\u6A21\u578B" } : {}
           }));
-          const modelAnswers = await ask(ctx, exec, [{ id: "model", header: "\u6A21\u578B", question: "\u9009\u62E9\u6A21\u578B", options: modelOptions }]);
+          const modelAnswers = await ask(ctx, exec, [{ id: "model", header: "\u6A21\u578B", question: "\u9009\u62E9\u6A21\u578B", options: modelOptions, initialSelected: [defaultModelLabel] }]);
           const rawModelChoice = selected(modelAnswers.model);
           if (!rawModelChoice) return result();
           const usesPluginDefault = rawModelChoice === defaultModelLabel;
@@ -1643,19 +1647,20 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
         if (videoCapability && selectedVideoInputMode) {
           const requiredAspectRatio = videoCapability.requiredAspectRatioByInputMode?.[selectedVideoInputMode];
           if (requiredAspectRatio && !params.aspect_ratio) params.aspect_ratio = requiredAspectRatio;
+          if (!params.resolution && videoCapability.resolutions.length === 1) params.resolution = videoCapability.defaultResolution;
           if (videoCapability.audioMode === "required" && params.generate_audio === void 0) params.generate_audio = true;
         }
         const outputQuestions = [];
-        if (intent === "image_gen" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio })) });
-        if (intent === "image_edit" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: ASPECT_RATIOS.map((ratio) => ({ label: ratio })) });
+        if (intent === "image_gen" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio })), initialSelected: [IMAGE_ASPECT_RATIOS[0]] });
+        if (intent === "image_edit" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: ASPECT_RATIOS.map((ratio) => ({ label: ratio })), initialSelected: [ASPECT_RATIOS[0]] });
         if (intent === "video_gen" && videoCapability && selectedVideoInputMode && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: videoCapability.aspectRatios.map((ratio) => {
           const label = videoAspectRatioLabel(ratio, selectedVideoInputMode);
           return { label };
-        }) });
-        if (intent === "video_gen" && videoCapability && !params.duration) outputQuestions.push({ id: "duration", header: "\u65F6\u957F", question: "\u9009\u62E9\u89C6\u9891\u65F6\u957F", options: videoCapability.durations.map((duration) => ({ label: `${duration} \u79D2` })) });
-        if (intent === "video_gen" && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: "resolution", header: "\u5206\u8FA8\u7387", question: "\u9009\u62E9\u89C6\u9891\u5206\u8FA8\u7387", options: videoCapability.resolutions.map((resolution) => ({ label: resolution })) });
-        if (intent === "video_gen" && videoCapability?.audioMode === "optional" && params.generate_audio === void 0) outputQuestions.push({ id: "generate_audio", header: "\u751F\u6210\u97F3\u9891", question: "\u662F\u5426\u751F\u6210\u89C6\u9891\u97F3\u9891\uFF1F", options: [{ label: "\u5F00\u542F\u97F3\u9891", description: "\u89C6\u9891\u5C06\u5305\u542B\u6A21\u578B\u751F\u6210\u7684\u97F3\u9891" }, { label: "\u5173\u95ED\u97F3\u9891", description: "\u751F\u6210\u65E0\u97F3\u9891\u89C6\u9891" }] });
-        if ((intent === "image_gen" || intent === "image_edit") && !params.n) outputQuestions.push({ id: "n", header: "\u6570\u91CF", question: "\u751F\u6210\u51E0\u5F20\uFF1F", options: [{ label: "1 \u5F20" }, { label: "2 \u5F20" }, { label: "4 \u5F20" }] });
+        }), initialSelected: [videoAspectRatioLabel(videoCapability.defaultAspectRatio, selectedVideoInputMode)] });
+        if (intent === "video_gen" && videoCapability && !params.duration) outputQuestions.push({ id: "duration", header: "\u65F6\u957F", question: "\u9009\u62E9\u89C6\u9891\u65F6\u957F", options: videoCapability.durations.map((duration) => ({ label: `${duration} \u79D2` })), initialSelected: [`${videoCapability.defaultDuration} \u79D2`] });
+        if (intent === "video_gen" && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: "resolution", header: "\u5206\u8FA8\u7387", question: "\u9009\u62E9\u89C6\u9891\u5206\u8FA8\u7387", options: videoCapability.resolutions.map((resolution) => ({ label: resolution })), initialSelected: [videoCapability.defaultResolution] });
+        if (intent === "video_gen" && videoCapability?.audioMode === "optional" && params.generate_audio === void 0) outputQuestions.push({ id: "generate_audio", header: "\u751F\u6210\u97F3\u9891", question: "\u662F\u5426\u751F\u6210\u89C6\u9891\u97F3\u9891\uFF1F", options: [{ label: "\u5F00\u542F\u97F3\u9891", description: "\u89C6\u9891\u5C06\u5305\u542B\u6A21\u578B\u751F\u6210\u7684\u97F3\u9891" }, { label: "\u5173\u95ED\u97F3\u9891", description: "\u751F\u6210\u65E0\u97F3\u9891\u89C6\u9891" }], initialSelected: [videoCapability.defaultAudioEnabled ? "\u5F00\u542F\u97F3\u9891" : "\u5173\u95ED\u97F3\u9891"] });
+        if ((intent === "image_gen" || intent === "image_edit") && !params.n) outputQuestions.push({ id: "n", header: "\u6570\u91CF", question: "\u751F\u6210\u51E0\u5F20\uFF1F", options: [{ label: "1 \u5F20" }, { label: "2 \u5F20" }, { label: "4 \u5F20" }], initialSelected: ["1 \u5F20"] });
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions);
           if (answers.aspect_ratio) params.aspect_ratio = intent === "video_gen" ? parseVideoAspectRatioLabel(selected(answers.aspect_ratio)) : stripRecommended(selected(answers.aspect_ratio));
@@ -1665,7 +1670,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
           if (answers.n) params.n = numberLabel(selected(answers.n));
         }
         validateWizardKnown(intent, params, config);
-        const videoParametersPresent = videoCapability ? Boolean(params.duration) && (videoCapability.resolutions.length === 1 || Boolean(params.resolution)) && (videoCapability.audioMode !== "optional" || typeof params.generate_audio === "boolean") : false;
+        const videoParametersPresent = videoCapability ? Boolean(params.duration) && Boolean(params.resolution) && (videoCapability.audioMode !== "optional" || typeof params.generate_audio === "boolean") : false;
         const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === "video_gen" ? videoParametersPresent : Boolean(params.n));
         if (!requiredParametersPresent) return result();
         const taskLabel = intent === "image_edit" ? "\u56FE\u7247\u7F16\u8F91" : intent === "video_gen" ? "\u89C6\u9891\u751F\u6210" : "\u56FE\u7247\u751F\u6210";
@@ -1689,7 +1694,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
         ];
         if (params.skipFinalConfirmation === true) finalConfirmed = true;
         else {
-          const finalAnswers = await ask(ctx, exec, [{ id: "final_confirm", header: "\u6700\u7EC8\u786E\u8BA4", question: "\u6309\u4EE5\u4E0B\u5B8C\u6574\u914D\u7F6E\u521B\u5EFA\u4EFB\u52A1\u5417\uFF1F", detail: parameterLines.join("\n"), options: [{ label: "\u786E\u8BA4\u751F\u6210" }, { label: "\u53D6\u6D88" }] }]);
+          const finalAnswers = await ask(ctx, exec, [{ id: "final_confirm", header: "\u6700\u7EC8\u786E\u8BA4", question: "\u6309\u4EE5\u4E0B\u5B8C\u6574\u914D\u7F6E\u521B\u5EFA\u4EFB\u52A1\u5417\uFF1F", detail: parameterLines.join("\n"), options: [{ label: "\u786E\u8BA4\u751F\u6210" }, { label: "\u53D6\u6D88" }], initialSelected: ["\u786E\u8BA4\u751F\u6210"] }]);
           finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === "\u786E\u8BA4\u751F\u6210";
         }
         return result();
@@ -1705,8 +1710,8 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
     parameters: {
       prompt: { type: "string", required: true },
       model: { type: "string", enum: [...IMAGE_MODELS] },
-      aspect_ratio: { type: "string", enum: [...IMAGE_ASPECT_RATIOS] },
-      n: { type: "integer" }
+      aspect_ratio: { type: "string", enum: [...IMAGE_ASPECT_RATIOS], required: true },
+      n: { type: "integer", enum: [1, 2, 4], required: true }
     },
     output: {
       schema: imageOutputSchema(),
@@ -1719,7 +1724,10 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
     },
     async execute(args, exec) {
       const model = args.model ?? config.defaultImageModel;
-      const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio ?? "1:1", n: args.n ?? 1 };
+      if (!args.aspect_ratio) throw new Error("Missing confirmed aspect_ratio; image task was not submitted.");
+      if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error("Missing or invalid confirmed n; image task was not submitted.");
+      validateWizardKnown("image_gen", { ...args, model }, config);
+      const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio, n: args.n };
       const taskId = await api.submit("images", body, exec.signal, body);
       const data = await api.poll(taskId, exec.signal);
       const timedOut = data.timedOut === true;
@@ -1735,8 +1743,8 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       prompt: { type: "string", required: true },
       image: { type: "string", description: "Optional image source: dsh-attachment:latest, first, last, a 1-based selector such as dsh-attachment:2, index:N, a current-conversation attachment id, HTTPS URL, local path, or data URL. Defaults to the latest user-uploaded conversation image." },
       model: { type: "string", enum: [...IMAGE_EDIT_MODELS] },
-      aspect_ratio: { type: "string", enum: [...ASPECT_RATIOS] },
-      n: { type: "integer" }
+      aspect_ratio: { type: "string", enum: [...ASPECT_RATIOS], required: true },
+      n: { type: "integer", enum: [1, 2, 4], required: true }
     },
     output: {
       schema: imageOutputSchema(),
@@ -1744,15 +1752,18 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
     },
     async execute(args, exec) {
       const model = args.model ?? config.defaultEditModel;
+      if (!args.aspect_ratio) throw new Error("Missing confirmed aspect_ratio; image edit task was not submitted.");
+      if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error("Missing or invalid confirmed n; image edit task was not submitted.");
       if (!IMAGE_EDIT_MODELS.includes(model)) {
         throw new Error(`Model ${model} does not support image editing. Choose image2 or qwen_image.`);
       }
+      validateWizardKnown("image_edit", { ...args, model }, config);
       const image = await prepareInput(config, api, args.image, exec, attachments);
       const body = {
         model,
         prompt: args.prompt,
-        n: args.n ?? 1,
-        ...args.aspect_ratio ? { aspect_ratio: args.aspect_ratio } : {},
+        n: args.n,
+        aspect_ratio: args.aspect_ratio,
         input_references: [{ type: "image_url", slot_name: "reference_1", image_url: { url: image } }]
       };
       const deduplicationInput = { ...args, model, image: args.image ?? "dsh-attachment:latest" };
@@ -1804,10 +1815,10 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
     parameters: {
       prompt: { type: "string", required: true },
       model: { type: "string", enum: [...VIDEO_MODELS] },
-      duration: { type: "integer", enum: [...DURATIONS] },
-      resolution: { type: "string", enum: [...SEEDANCE_RESOLUTIONS] },
-      aspect_ratio: { type: "string", enum: [...VIDEO_ASPECT_RATIOS] },
-      generate_audio: { type: "boolean", description: "Seedance audio switch. LTX 2.3, LTX 2.5, and MiniMax H3 audio remains enabled." },
+      duration: { type: "integer", enum: [...DURATIONS], required: true },
+      resolution: { type: "string", enum: [...SEEDANCE_RESOLUTIONS], required: true },
+      aspect_ratio: { type: "string", enum: [...VIDEO_ASPECT_RATIOS], required: true },
+      generate_audio: { type: "boolean", required: true, description: "Confirmed wizard audio value. Seedance exposes the switch; LTX 2.3, LTX 2.5, and MiniMax H3 require true." },
       image_url: { type: "string", description: "Legacy first-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." },
       reference_images: { type: "array", items: { type: "string" }, description: "Reference image inputs support dsh-attachment selectors, although the current production video contract may reject generic references." },
       start_image: { type: "string", description: "First-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." },
@@ -1825,11 +1836,17 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       const inputMode = videoInputMode({ ...args, ...firstInput ? { start_image: firstInput } : {} });
       if (!capability.inputModes.includes(inputMode)) throw new Error(`${model} does not support video input mode ${inputMode}.`);
       const requiredAspectRatio = capability.requiredAspectRatioByInputMode?.[inputMode];
-      const aspectRatio = args.aspect_ratio ?? requiredAspectRatio;
+      if (!args.aspect_ratio) throw new Error("Missing confirmed aspect_ratio; video task was not submitted.");
+      if (!Number.isInteger(args.duration)) throw new Error("Missing confirmed duration; video task was not submitted.");
+      if (!args.resolution) throw new Error("Missing confirmed resolution; video task was not submitted.");
+      if (capability.audioMode !== "not_configurable" && typeof args.generate_audio !== "boolean") {
+        throw new Error("Missing confirmed generate_audio; video task was not submitted.");
+      }
+      const aspectRatio = args.aspect_ratio;
       if (capability.audioMode === "required" && args.generate_audio === false) {
         throw new Error(`${model} requires generated audio to remain enabled.`);
       }
-      const generateAudio = capability.audioMode === "required" ? true : args.generate_audio ?? capability.defaultAudioEnabled;
+      const generateAudio = capability.audioMode === "required" ? true : args.generate_audio;
       validateWizardKnown("video_gen", {
         ...args,
         model,

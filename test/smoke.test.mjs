@@ -25,6 +25,9 @@ test('client bundle exposes per-image downloads through the safe host route', as
   assert.match(client, /'aria-label': '下载图片'/)
   assert.match(client, /M12 3v11m0 0 4-4/)
   assert.match(client, /download: filename/)
+  assert.match(client, /compactDownloadTimestamp/)
+  assert.match(client, /imageTaskId/)
+  assert.match(client, /tokensapi-image-\$\{index \+ 1\}-\$\{timestamp\}/)
 })
 
 test('wizard recommendation labels use plain Chinese text instead of the UI badge trigger', async () => {

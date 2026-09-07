@@ -632,7 +632,7 @@ Known-field contract: prompt is the current requested content or edit; promptSou
 
 Reuse contract: previousTask contains only the most recent completed same-intent task and its final params. reuse contains explicit per-category decisions only when the user already said whether to reuse prompt, references, or settings. Use true for explicit reuse and false for explicit reset. Leave a category absent when the request is ambiguous, such as "generate another video", so the wizard asks. Phrases such as "another identical one" can set all available categories true; "do not reuse anything" can set them false; "change the content but keep other settings" should set prompt false and settings true. Current known values always win over reused values.
 
-The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice. For video generation, pass the wizard's generate_audio value to media_generate_video when present.
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
 
 Submission safety contract: a network error, HTTP 429, unchanged progress, or a timed-out foreground wait does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, or says the submission status is uncertain, do not call a media_generate_* tool again for that request. Continue with media_task_status when a taskId is known. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`,
   })
@@ -711,6 +711,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           id: 'reuse_prompt', header: '历史 Prompt', question: '是否复用上一次任务的 Prompt？',
           detail: `上次 Prompt：${truncatedPrompt(reusablePrompt.prompt)}`,
           options: [{ label: '不复用', description: '按本次新任务重新填写 Prompt' }, { label: '复用', description: '沿用上一次任务的 Prompt' }],
+          initialSelected: ['复用'],
         })
       }
       if (Object.keys(reusableReferences).length && reuseDecisions.references === undefined) {
@@ -718,6 +719,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           id: 'reuse_references', header: '历史参考素材', question: '是否复用上一次任务的参考图或首尾帧？',
           detail: reusableReferenceDetail(intent, reusableReferences),
           options: [{ label: '不复用', description: '本次不使用历史参考素材' }, { label: '复用', description: '沿用上一次任务的参考素材' }],
+          initialSelected: ['复用'],
         })
       }
       if (Object.keys(reusableSettings).length && reuseDecisions.settings === undefined) {
@@ -725,6 +727,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           id: 'reuse_settings', header: '历史生成参数', question: '是否复用上一次任务的生成参数？',
           detail: reusableSettingsDetail(reusableSettings),
           options: [{ label: '不复用', description: '重新选择模型和输出参数' }, { label: '复用', description: '沿用可兼容的模型和输出参数' }],
+          initialSelected: ['复用'],
         })
       }
       if (reuseQuestions.length) {
@@ -768,7 +771,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         if (intent === 'video_gen') {
           const hasInput = params.image_url || params.start_image || params.end_image || (Array.isArray(params.reference_images) && params.reference_images.length)
           if (!hasInput && !params.prompt) {
-            const answers = await ask(ctx, exec, [{ id: 'video_input', header: '视频类型', question: '选择视频生成方式', options: [{ label: '纯文生视频' }, { label: '使用首帧图片' }, { label: '使用首帧和尾帧图片' }] }])
+            const answers = await ask(ctx, exec, [{ id: 'video_input', header: '视频类型', question: '选择视频生成方式', options: [{ label: '纯文生视频' }, { label: '使用首帧图片' }, { label: '使用首帧和尾帧图片' }], initialSelected: ['纯文生视频'] }])
             const choice = stripRecommended(selected(answers.video_input))
             if (!choice) return result()
             if (choice === '使用首帧图片') {
@@ -812,6 +815,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
             question: '是否增强下面的 Prompt？',
             detail: `当前 Prompt\n来源：${promptSourceDescription(params.promptSource)}\n\n${params.prompt}`,
             options: enhanceOptions,
+            initialSelected: [config.enhanceEnabled ? '增强 Prompt' : '保持原始 Prompt'],
           }])
           const choice = stripRecommended(selected(answers.enhance))
           if (!choice) return result()
@@ -825,7 +829,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         }
         const promptWasEnhanced = Boolean(params.originalPrompt && params.prompt !== params.originalPrompt)
         if (promptWasEnhanced) {
-          const promptAnswers = await ask(ctx, exec, [{ id: 'prompt_confirm', header: '确认增强后 Prompt', question: 'Prompt 已被增强，是否使用增强后的内容？', detail: `原始 Prompt:\n${params.originalPrompt}\n\n增强后 Prompt:\n${params.prompt}`, options: [{ label: '确认增强后 Prompt' }, { label: '取消' }] }])
+          const promptAnswers = await ask(ctx, exec, [{ id: 'prompt_confirm', header: '确认增强后 Prompt', question: 'Prompt 已被增强，是否使用增强后的内容？', detail: `原始 Prompt:\n${params.originalPrompt}\n\n增强后 Prompt:\n${params.prompt}`, options: [{ label: '确认增强后 Prompt' }, { label: '取消' }], initialSelected: ['确认增强后 Prompt'] }])
           promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === '确认增强后 Prompt'
         } else promptConfirmed = Boolean(params.prompt)
         if (!promptConfirmed) return result()
@@ -843,7 +847,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
               ? { description: `${model === defaultModel ? '使用插件当前配置的默认模型；' : ''}${videoModelDescription(model as VideoModel)}` }
               : model === defaultModel ? { description: '使用插件当前配置的默认模型' } : {}),
           }))
-          const modelAnswers = await ask(ctx, exec, [{ id: 'model', header: '模型', question: '选择模型', options: modelOptions }])
+          const modelAnswers = await ask(ctx, exec, [{ id: 'model', header: '模型', question: '选择模型', options: modelOptions, initialSelected: [defaultModelLabel] }])
           const rawModelChoice = selected(modelAnswers.model)
           if (!rawModelChoice) return result()
           const usesPluginDefault = rawModelChoice === defaultModelLabel
@@ -857,19 +861,20 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         if (videoCapability && selectedVideoInputMode) {
           const requiredAspectRatio = videoCapability.requiredAspectRatioByInputMode?.[selectedVideoInputMode]
           if (requiredAspectRatio && !params.aspect_ratio) params.aspect_ratio = requiredAspectRatio
+          if (!params.resolution && videoCapability.resolutions.length === 1) params.resolution = videoCapability.defaultResolution
           if (videoCapability.audioMode === 'required' && params.generate_audio === undefined) params.generate_audio = true
         }
         const outputQuestions: AnyRecord[] = []
-        if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio })) })
-        if (intent === 'image_edit' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio) => ({ label: ratio })) })
+        if (intent === 'image_gen' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio })), initialSelected: [IMAGE_ASPECT_RATIOS[0]] })
+        if (intent === 'image_edit' && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: ASPECT_RATIOS.map((ratio) => ({ label: ratio })), initialSelected: [ASPECT_RATIOS[0]] })
         if (intent === 'video_gen' && videoCapability && selectedVideoInputMode && !params.aspect_ratio) outputQuestions.push({ id: 'aspect_ratio', header: '画面比例', question: '选择画面比例', options: videoCapability.aspectRatios.map((ratio) => {
           const label = videoAspectRatioLabel(ratio, selectedVideoInputMode)
           return { label }
-        }) })
-        if (intent === 'video_gen' && videoCapability && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: videoCapability.durations.map((duration) => ({ label: `${duration} 秒` })) })
-        if (intent === 'video_gen' && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: videoCapability.resolutions.map((resolution) => ({ label: resolution })) })
-        if (intent === 'video_gen' && videoCapability?.audioMode === 'optional' && params.generate_audio === undefined) outputQuestions.push({ id: 'generate_audio', header: '生成音频', question: '是否生成视频音频？', options: [{ label: '开启音频', description: '视频将包含模型生成的音频' }, { label: '关闭音频', description: '生成无音频视频' }] })
-        if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({ id: 'n', header: '数量', question: '生成几张？', options: [{ label: '1 张' }, { label: '2 张' }, { label: '4 张' }] })
+        }), initialSelected: [videoAspectRatioLabel(videoCapability.defaultAspectRatio, selectedVideoInputMode)] })
+        if (intent === 'video_gen' && videoCapability && !params.duration) outputQuestions.push({ id: 'duration', header: '时长', question: '选择视频时长', options: videoCapability.durations.map((duration) => ({ label: `${duration} 秒` })), initialSelected: [`${videoCapability.defaultDuration} 秒`] })
+        if (intent === 'video_gen' && videoCapability && videoCapability.resolutions.length > 1 && !params.resolution) outputQuestions.push({ id: 'resolution', header: '分辨率', question: '选择视频分辨率', options: videoCapability.resolutions.map((resolution) => ({ label: resolution })), initialSelected: [videoCapability.defaultResolution] })
+        if (intent === 'video_gen' && videoCapability?.audioMode === 'optional' && params.generate_audio === undefined) outputQuestions.push({ id: 'generate_audio', header: '生成音频', question: '是否生成视频音频？', options: [{ label: '开启音频', description: '视频将包含模型生成的音频' }, { label: '关闭音频', description: '生成无音频视频' }], initialSelected: [videoCapability.defaultAudioEnabled ? '开启音频' : '关闭音频'] })
+        if ((intent === 'image_gen' || intent === 'image_edit') && !params.n) outputQuestions.push({ id: 'n', header: '数量', question: '生成几张？', options: [{ label: '1 张' }, { label: '2 张' }, { label: '4 张' }], initialSelected: ['1 张'] })
         if (outputQuestions.length) {
           const answers = await ask(ctx, exec, outputQuestions)
           if (answers.aspect_ratio) params.aspect_ratio = intent === 'video_gen'
@@ -883,7 +888,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         validateWizardKnown(intent, params, config)
         const videoParametersPresent = videoCapability
           ? Boolean(params.duration)
-            && (videoCapability.resolutions.length === 1 || Boolean(params.resolution))
+            && Boolean(params.resolution)
             && (videoCapability.audioMode !== 'optional' || typeof params.generate_audio === 'boolean')
           : false
         const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === 'video_gen' ? videoParametersPresent : Boolean(params.n))
@@ -911,7 +916,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         ]
         if (params.skipFinalConfirmation === true) finalConfirmed = true
         else {
-          const finalAnswers = await ask(ctx, exec, [{ id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: parameterLines.join('\n'), options: [{ label: '确认生成' }, { label: '取消' }] }])
+          const finalAnswers = await ask(ctx, exec, [{ id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: parameterLines.join('\n'), options: [{ label: '确认生成' }, { label: '取消' }], initialSelected: ['确认生成'] }])
           finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === '确认生成'
         }
         return result()
@@ -928,8 +933,8 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
     parameters: {
       prompt: { type: 'string', required: true },
       model: { type: 'string', enum: [...IMAGE_MODELS] },
-      aspect_ratio: { type: 'string', enum: [...IMAGE_ASPECT_RATIOS] },
-      n: { type: 'integer' },
+      aspect_ratio: { type: 'string', enum: [...IMAGE_ASPECT_RATIOS], required: true },
+      n: { type: 'integer', enum: [1, 2, 4], required: true },
     },
     output: {
       schema: imageOutputSchema(),
@@ -942,7 +947,10 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
     },
     async execute(args: AnyRecord, exec: AnyRecord) {
       const model = args.model ?? config.defaultImageModel
-      const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio ?? '1:1', n: args.n ?? 1 }
+      if (!args.aspect_ratio) throw new Error('Missing confirmed aspect_ratio; image task was not submitted.')
+      if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error('Missing or invalid confirmed n; image task was not submitted.')
+      validateWizardKnown('image_gen', { ...args, model }, config)
+      const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio, n: args.n }
       const taskId = await api.submit('images', body, exec.signal, body)
       const data = await api.poll(taskId, exec.signal)
       const timedOut = data.timedOut === true
@@ -959,8 +967,8 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       prompt: { type: 'string', required: true },
       image: { type: 'string', description: 'Optional image source: dsh-attachment:latest, first, last, a 1-based selector such as dsh-attachment:2, index:N, a current-conversation attachment id, HTTPS URL, local path, or data URL. Defaults to the latest user-uploaded conversation image.' },
       model: { type: 'string', enum: [...IMAGE_EDIT_MODELS] },
-      aspect_ratio: { type: 'string', enum: [...ASPECT_RATIOS] },
-      n: { type: 'integer' },
+      aspect_ratio: { type: 'string', enum: [...ASPECT_RATIOS], required: true },
+      n: { type: 'integer', enum: [1, 2, 4], required: true },
     },
     output: {
       schema: imageOutputSchema(),
@@ -968,15 +976,18 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
     },
     async execute(args: AnyRecord, exec: AnyRecord) {
       const model = args.model ?? config.defaultEditModel
+      if (!args.aspect_ratio) throw new Error('Missing confirmed aspect_ratio; image edit task was not submitted.')
+      if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error('Missing or invalid confirmed n; image edit task was not submitted.')
       if (!(IMAGE_EDIT_MODELS as readonly string[]).includes(model)) {
         throw new Error(`Model ${model} does not support image editing. Choose image2 or qwen_image.`)
       }
+      validateWizardKnown('image_edit', { ...args, model }, config)
       const image = await prepareInput(config, api, args.image, exec, attachments)
       const body = {
         model,
         prompt: args.prompt,
-        n: args.n ?? 1,
-        ...(args.aspect_ratio ? { aspect_ratio: args.aspect_ratio } : {}),
+        n: args.n,
+        aspect_ratio: args.aspect_ratio,
         input_references: [{ type: 'image_url', slot_name: 'reference_1', image_url: { url: image } }],
       }
       const deduplicationInput = { ...args, model, image: args.image ?? 'dsh-attachment:latest' }
@@ -1030,10 +1041,10 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
     parameters: {
       prompt: { type: 'string', required: true },
       model: { type: 'string', enum: [...VIDEO_MODELS] },
-      duration: { type: 'integer', enum: [...DURATIONS] },
-      resolution: { type: 'string', enum: [...SEEDANCE_RESOLUTIONS] },
-      aspect_ratio: { type: 'string', enum: [...VIDEO_ASPECT_RATIOS] },
-      generate_audio: { type: 'boolean', description: 'Seedance audio switch. LTX 2.3, LTX 2.5, and MiniMax H3 audio remains enabled.' },
+      duration: { type: 'integer', enum: [...DURATIONS], required: true },
+      resolution: { type: 'string', enum: [...SEEDANCE_RESOLUTIONS], required: true },
+      aspect_ratio: { type: 'string', enum: [...VIDEO_ASPECT_RATIOS], required: true },
+      generate_audio: { type: 'boolean', required: true, description: 'Confirmed wizard audio value. Seedance exposes the switch; LTX 2.3, LTX 2.5, and MiniMax H3 require true.' },
       image_url: { type: 'string', description: 'Legacy first-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL.' },
       reference_images: { type: 'array', items: { type: 'string' }, description: 'Reference image inputs support dsh-attachment selectors, although the current production video contract may reject generic references.' },
       start_image: { type: 'string', description: 'First-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL.' },
@@ -1051,13 +1062,19 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       const inputMode = videoInputMode({ ...args, ...(firstInput ? { start_image: firstInput } : {}) })
       if (!capability.inputModes.includes(inputMode)) throw new Error(`${model} does not support video input mode ${inputMode}.`)
       const requiredAspectRatio = capability.requiredAspectRatioByInputMode?.[inputMode]
-      const aspectRatio = args.aspect_ratio ?? requiredAspectRatio
+      if (!args.aspect_ratio) throw new Error('Missing confirmed aspect_ratio; video task was not submitted.')
+      if (!Number.isInteger(args.duration)) throw new Error('Missing confirmed duration; video task was not submitted.')
+      if (!args.resolution) throw new Error('Missing confirmed resolution; video task was not submitted.')
+      if (capability.audioMode !== 'not_configurable' && typeof args.generate_audio !== 'boolean') {
+        throw new Error('Missing confirmed generate_audio; video task was not submitted.')
+      }
+      const aspectRatio = args.aspect_ratio
       if (capability.audioMode === 'required' && args.generate_audio === false) {
         throw new Error(`${model} requires generated audio to remain enabled.`)
       }
       const generateAudio = capability.audioMode === 'required'
         ? true
-        : args.generate_audio ?? capability.defaultAudioEnabled
+        : args.generate_audio
       validateWizardKnown('video_gen', {
         ...args,
         model,

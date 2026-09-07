@@ -162,6 +162,7 @@ test('ambiguous follow-up asks before reusing prior prompt, references, and sett
   assert.ok(reuseCall)
   assert.deepEqual(reuseCall.map((question) => question.id), ['reuse_prompt', 'reuse_references', 'reuse_settings'])
   assert.deepEqual(reuseCall[0].options.map((option) => option.label), ['不复用', '复用'])
+  assert.ok(reuseCall.every((question) => question.initialSelected?.[0] === '复用'))
   assert.equal(result.reuseDecisions.prompt, false)
   assert.equal(result.reuseDecisions.references, false)
   assert.equal(result.reuseDecisions.settings, false)
@@ -315,6 +316,49 @@ test('wizard recommendation marker appears only in model selection', async () =>
   assert.doesNotMatch(finalQuestion.detail, /推荐/)
 })
 
+test('every option question exposes one valid initial selection without adding recommendation markers', async () => {
+  const { tools, questionCalls } = await createHarness((questions) => ({
+    answers: questions.map((question) => ({
+      id: question.id,
+      selected: question.initialSelected ?? [],
+    })),
+  }))
+  const wizard = tools.get('media_wizard')
+
+  const result = await wizard.execute({
+    intent: 'video_gen',
+    known: { prompt: 'A cinematic camera move through a quiet gallery' },
+  }, execContext())
+
+  assert.equal(result.confirmed, true)
+  const optionQuestions = questionCalls.flat().filter((question) => Array.isArray(question.options))
+  assert.ok(optionQuestions.length > 0)
+  for (const question of optionQuestions) {
+    assert.equal(question.initialSelected?.length, 1, `${question.id} should have exactly one initial selection`)
+    assert.ok(
+      question.options.some((option) => option.label === question.initialSelected[0]),
+      `${question.id} initial selection should name an existing option`,
+    )
+  }
+  assert.deepEqual(
+    Object.fromEntries(optionQuestions.map((question) => [question.id, question.initialSelected[0]])),
+    {
+      enhance: '增强 Prompt',
+      model: 'minimax_h3（推荐）',
+      aspect_ratio: '16:9',
+      duration: '5 秒',
+      resolution: '720p',
+      final_confirm: '确认生成',
+    },
+  )
+  assert.deepEqual(
+    optionQuestions.flatMap((question) => question.options
+      .filter((option) => option.label.includes('（推荐）'))
+      .map((option) => ({ questionId: question.id, label: option.label }))),
+    [{ questionId: 'model', label: 'minimax_h3（推荐）' }],
+  )
+})
+
 test('seedance 2.5 first-frame wizard enforces adaptive ratio and allows disabling audio', async () => {
   let finalDetail = ''
   const { tools, questionCalls } = await createHarness((questions) => {
@@ -415,6 +459,7 @@ test('video wizard final confirmation summarizes fixed generated audio', async (
 
   assert.equal(result.confirmed, true)
   assert.equal(result.params.generate_audio, true)
+  assert.equal(result.params.resolution, '720p')
   assert.match(finalDetail, /- 分辨率: 720p/)
   assert.match(finalDetail, /- 音频: 自动生成音频（模型固定开启）/)
 })
@@ -434,6 +479,123 @@ test('video generation tool schema accepts the five models and combined video ra
   assert.ok(videoTool.parameters.properties.aspect_ratio.enum.includes('3:2'))
   assert.ok(videoTool.parameters.properties.aspect_ratio.enum.includes('2:3'))
   assert.equal(videoTool.parameters.properties.generate_audio.type, 'boolean')
+  assert.ok(videoTool.parameters.required.includes('duration'))
+  assert.ok(videoTool.parameters.required.includes('resolution'))
+  assert.ok(videoTool.parameters.required.includes('aspect_ratio'))
+  assert.ok(videoTool.parameters.required.includes('generate_audio'))
+})
+
+test('image tool schemas require the wizard-confirmed ratio and count', async () => {
+  const { tools } = await createHarness()
+  for (const name of ['media_generate_image', 'media_edit_image']) {
+    const tool = tools.get(name)
+    assert.ok(tool.parameters.required.includes('aspect_ratio'))
+    assert.ok(tool.parameters.required.includes('n'))
+    assert.deepEqual(tool.parameters.properties.n.enum, [1, 2, 4])
+  }
+})
+
+test('image tools reject missing confirmed output parameters before submission', async () => {
+  const { mod, tools } = await createHarness()
+  let submissions = 0
+  const originalSubmit = mod.TokensApiClient.prototype.submit
+  mod.TokensApiClient.prototype.submit = async function () {
+    submissions += 1
+    return 'unexpected_task'
+  }
+
+  try {
+    await assert.rejects(() => tools.get('media_generate_image').execute({
+      prompt: 'A red fox in snow',
+      n: 2,
+    }, execContext()), /missing required property "aspect_ratio"/)
+    await assert.rejects(() => tools.get('media_generate_image').execute({
+      prompt: 'A red fox in snow',
+      aspect_ratio: '16:9',
+    }, execContext()), /missing required property "n"/)
+    await assert.rejects(() => tools.get('media_edit_image').execute({
+      prompt: 'Make the sky brighter',
+      image: 'https://example.com/input.png',
+      n: 2,
+    }, execContext()), /missing required property "aspect_ratio"/)
+    await assert.rejects(() => tools.get('media_edit_image').execute({
+      prompt: 'Make the sky brighter',
+      image: 'https://example.com/input.png',
+      aspect_ratio: '16:9',
+    }, execContext()), /missing required property "n"/)
+    assert.equal(submissions, 0)
+  } finally {
+    mod.TokensApiClient.prototype.submit = originalSubmit
+  }
+})
+
+test('image tools submit the exact confirmed ratio and count', async () => {
+  const { mod, tools } = await createHarness()
+  const requests = []
+  const originalSubmit = mod.TokensApiClient.prototype.submit
+  const originalPoll = mod.TokensApiClient.prototype.poll
+  mod.TokensApiClient.prototype.submit = async function (kind, body) {
+    requests.push({ kind, body })
+    return `task_${requests.length}`
+  }
+  mod.TokensApiClient.prototype.poll = async function () {
+    return { results: [] }
+  }
+
+  try {
+    await tools.get('media_generate_image').execute({
+      prompt: 'A red fox in snow',
+      aspect_ratio: '16:9',
+      n: 2,
+    }, execContext())
+    await tools.get('media_edit_image').execute({
+      prompt: 'Make the sky brighter',
+      image: 'https://example.com/input.png',
+      aspect_ratio: '16:9',
+      n: 2,
+    }, execContext())
+  } finally {
+    mod.TokensApiClient.prototype.submit = originalSubmit
+    mod.TokensApiClient.prototype.poll = originalPoll
+  }
+
+  assert.equal(requests.length, 2)
+  assert.ok(requests.every((request) => request.kind === 'images'))
+  assert.ok(requests.every((request) => request.body.aspect_ratio === '16:9'))
+  assert.ok(requests.every((request) => request.body.n === 2))
+})
+
+test('video tool rejects missing confirmed output parameters before submission', async () => {
+  const { mod, tools } = await createHarness()
+  const videoTool = tools.get('media_generate_video')
+  let submissions = 0
+  const originalSubmit = mod.TokensApiClient.prototype.submit
+  mod.TokensApiClient.prototype.submit = async function () {
+    submissions += 1
+    return 'unexpected_task'
+  }
+  const complete = {
+    prompt: 'A cinematic landscape',
+    model: 'seedance_2_5',
+    duration: 5,
+    resolution: '720p',
+    aspect_ratio: '16:9',
+    generate_audio: true,
+  }
+
+  try {
+    for (const field of ['duration', 'resolution', 'aspect_ratio', 'generate_audio']) {
+      const args = { ...complete }
+      delete args[field]
+      await assert.rejects(
+        () => videoTool.execute(args, execContext()),
+        new RegExp(`missing required property "${field}"`),
+      )
+    }
+    assert.equal(submissions, 0)
+  } finally {
+    mod.TokensApiClient.prototype.submit = originalSubmit
+  }
 })
 
 test('video request body applies each model audio strategy without network access', async () => {
@@ -455,7 +617,9 @@ test('video request body applies each model audio strategy without network acces
       prompt: 'A city at sunrise',
       model: 'ltx_2_3',
       duration: 5,
+      resolution: '720p',
       aspect_ratio: '16:9',
+      generate_audio: true,
     }, execContext())
     assert.equal(ltx23.generateAudio, true)
     assert.equal('generate_audio' in requests.at(-1).body, false)
@@ -466,6 +630,7 @@ test('video request body applies each model audio strategy without network acces
       duration: 5,
       resolution: '1080p',
       aspect_ratio: '16:9',
+      generate_audio: true,
     }, execContext())
     assert.equal(ltx25.generateAudio, true)
     assert.equal(requests.at(-1).body.generate_audio, true)
@@ -476,6 +641,7 @@ test('video request body applies each model audio strategy without network acces
       duration: 5,
       resolution: '720p',
       generate_audio: false,
+      aspect_ratio: 'adaptive',
       start_image: 'https://example.com/start.png',
     }, execContext())
     assert.equal(seedance25.generateAudio, false)
@@ -489,6 +655,7 @@ test('video request body applies each model audio strategy without network acces
       duration: 10,
       resolution: '480p',
       aspect_ratio: '3:2',
+      generate_audio: true,
     }, execContext())
     assert.equal(h3.generateAudio, true)
     assert.equal(requests.at(-1).body.generate_audio, true)
