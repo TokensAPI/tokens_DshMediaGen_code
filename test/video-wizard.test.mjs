@@ -668,6 +668,57 @@ test('video request body applies each model audio strategy without network acces
   assert.ok(requests.every((request) => request.kind === 'videos'))
 })
 
+test('completed videos stay remote and render inline without automatic downloads', async () => {
+  const { mod, tools } = await createHarness()
+  const videoTool = tools.get('media_generate_video')
+  const statusTool = tools.get('media_task_status')
+  const url = 'https://cdn.example.com/generated/video.mp4'
+  let downloadAttempts = 0
+  const originalSubmit = mod.TokensApiClient.prototype.submit
+  const originalPoll = mod.TokensApiClient.prototype.poll
+  const originalStatus = mod.TokensApiClient.prototype.status
+  const originalFetch = globalThis.fetch
+  mod.TokensApiClient.prototype.submit = async function () { return 'task_video_inline' }
+  mod.TokensApiClient.prototype.poll = async function () {
+    return { status: 'succeeded', progress: 100, results: [{ url }], media: { width: 1280, height: 720 } }
+  }
+  mod.TokensApiClient.prototype.status = async function () {
+    return { status: 'succeeded', progress: 100, results: [{ url }], media: { width: 1280, height: 720 } }
+  }
+  globalThis.fetch = async function () {
+    downloadAttempts += 1
+    throw new Error('Completed video URLs must not be downloaded automatically')
+  }
+  const execution = { ...execContext(), concludeTurn() {} }
+
+  try {
+    const generated = await videoTool.execute({
+      prompt: 'A paper boat crossing a quiet lake',
+      model: 'minimax_h3',
+      duration: 5,
+      resolution: '720p',
+      aspect_ratio: '16:9',
+      generate_audio: true,
+    }, execution)
+    assert.equal(generated.url, url)
+    assert.equal('filePath' in generated, false)
+    assert.equal('error' in generated, false)
+    assert.deepEqual(videoTool.output.render({}, generated)[0], { type: 'video', url })
+
+    const recovered = await statusTool.execute({ task_id: 'task_video_inline', kind: 'videos' }, execution)
+    assert.equal(recovered.url, url)
+    assert.equal('filePath' in recovered, false)
+    assert.equal('error' in recovered, false)
+    assert.deepEqual(statusTool.output.render({}, recovered)[0], { type: 'video', url })
+    assert.equal(downloadAttempts, 0)
+  } finally {
+    mod.TokensApiClient.prototype.submit = originalSubmit
+    mod.TokensApiClient.prototype.poll = originalPoll
+    mod.TokensApiClient.prototype.status = originalStatus
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('video request validation rejects invalid model parameters before submission', async () => {
   const { mod, tools } = await createHarness()
   const videoTool = tools.get('media_generate_video')

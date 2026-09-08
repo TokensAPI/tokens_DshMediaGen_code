@@ -17,7 +17,7 @@ import {
   resolveImageInput,
   videoModelCapability,
 } from '../shared/media.js'
-import { saveImages, saveVideo } from './results.js'
+import { saveImages } from './results.js'
 import { TokensApiClient } from './tokensapi.js'
 export { TokensApiClient } from './tokensapi.js'
 export { parseImageUploadGrant, validateImageUploadGrant } from './image-upload.js'
@@ -1037,7 +1037,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
 
   register({
     name: 'media_generate_video',
-    description: 'Generate a short TokensAPI video with model-aware duration, resolution, aspect-ratio, frame-image, and audio validation. Image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.',
+    description: 'Generate a short TokensAPI video with model-aware duration, resolution, aspect-ratio, frame-image, and audio validation, then render it inline from the remote result URL. Image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.',
     parameters: {
       prompt: { type: 'string', required: true },
       model: { type: 'string', enum: [...VIDEO_MODELS] },
@@ -1109,14 +1109,13 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       const data = await api.poll(taskId, exec.signal)
       if (data.timedOut === true) return { taskId, model, generateAudio, ...pendingTaskFields(data) }
       const url = api.urls(data)[0]
-      const saved = await saveVideo(url, taskId, config, exec.signal)
       const media = data.media && typeof data.media === 'object' ? data.media as AnyRecord : {}
       if (url) exec.concludeTurn()
       return {
         taskId,
         model,
         generateAudio,
-        ...saved,
+        ...(url ? { url } : {}),
         ...(typeof media.duration_seconds === 'number' ? { durationSeconds: media.duration_seconds } : {}),
         ...(typeof media.width === 'number' ? { width: media.width } : {}),
         ...(typeof media.height === 'number' ? { height: media.height } : {}),
@@ -1186,9 +1185,8 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         ? args.kind
         : data.media && typeof data.media === 'object' ? 'videos' : urls.some((url) => /\.(?:mp4|webm)(?:\?|$)/i.test(url)) ? 'videos' : 'images'
       if (detectedKind === 'videos') {
-        const saved = await saveVideo(urls[0], args.task_id, config, exec.signal)
         if (urls[0]) exec.concludeTurn()
-        return { taskId: args.task_id, status, progress, kind: 'videos', ...saved }
+        return { taskId: args.task_id, status, progress, kind: 'videos', ...(urls[0] ? { url: urls[0] } : {}) }
       }
       const images = await saveImages(urls, args.task_id, attachments, exec.signal)
       if (images.length > 0) exec.concludeTurn()

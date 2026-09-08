@@ -3,8 +3,8 @@ import Schema from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { homedir } from "node:os";
 import { createReadStream } from "node:fs";
-import { stat as stat3 } from "node:fs/promises";
-import { join as join2 } from "node:path";
+import { stat as stat2 } from "node:fs/promises";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 
 // src/shared/media.ts
@@ -191,8 +191,6 @@ function sanitizeTaskId(taskId) {
 }
 
 // src/host/results.ts
-import { mkdir, readFile as readFile2, stat as stat2, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 async function download(url, signal) {
   const response = await fetch(url, { signal });
   if (!response.ok) throw new Error(`Download failed (${response.status}) for ${url}`);
@@ -224,30 +222,6 @@ async function saveImages(urls, taskId, attachments, signal) {
       return { ...result, error: error instanceof Error ? error.message : String(error) };
     }
   }));
-}
-async function saveVideo(url, taskId, config, signal) {
-  if (!url) return {};
-  const result = { url };
-  try {
-    await mkdir(config.outputDir, { recursive: true });
-    const filePath = join(config.outputDir, `media_gen_${sanitizeTaskId(taskId)}.mp4`);
-    let reuse = false;
-    try {
-      const info = await stat2(filePath);
-      reuse = info.isFile() && info.size > 0;
-    } catch {
-    }
-    if (!reuse) {
-      const downloaded = await download(url, signal);
-      await writeFile(filePath, downloaded.bytes);
-    } else {
-      await readFile2(filePath, { flag: "r" });
-    }
-    result.filePath = filePath;
-  } catch (error) {
-    result.error = error instanceof Error ? error.message : String(error);
-  }
-  return result;
 }
 
 // src/host/tokensapi.ts
@@ -836,7 +810,7 @@ var inject = ["tools", "credentials", "userQuestions", "systemPrompt", "attachme
 var Config = Schema.object({
   baseURL: Schema.string().default("https://tokensapi.ai/v1"),
   apiKeyEnv: Schema.string().role("credential-ref").default("TOKENSAPI_API_KEY"),
-  outputDir: Schema.string().default(join2(homedir(), "Downloads", "dsh-media-gen")),
+  outputDir: Schema.string().default(join(homedir(), "Downloads", "dsh-media-gen")),
   pollIntervalMs: Schema.number().default(5e3),
   maxPollMs: Schema.number().default(12 * 60 * 1e3),
   defaultImageModel: Schema.union([...IMAGE_MODELS]).default("z_image_turbo"),
@@ -964,10 +938,10 @@ function registerVideoRoute(ctx, config) {
         res.end();
         return;
       }
-      const filePath = join2(config.outputDir, filename);
+      const filePath = join(config.outputDir, filename);
       let info;
       try {
-        info = await stat3(filePath);
+        info = await stat2(filePath);
       } catch {
         res.writeHead(404);
         res.end();
@@ -1811,7 +1785,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
   };
   register({
     name: "media_generate_video",
-    description: "Generate a short TokensAPI video with model-aware duration, resolution, aspect-ratio, frame-image, and audio validation. Image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.",
+    description: "Generate a short TokensAPI video with model-aware duration, resolution, aspect-ratio, frame-image, and audio validation, then render it inline from the remote result URL. Image inputs accept dsh-attachment selectors, HTTPS URLs, local paths, and data URLs.",
     parameters: {
       prompt: { type: "string", required: true },
       model: { type: "string", enum: [...VIDEO_MODELS] },
@@ -1881,14 +1855,13 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       const data = await api.poll(taskId, exec.signal);
       if (data.timedOut === true) return { taskId, model, generateAudio, ...pendingTaskFields(data) };
       const url = api.urls(data)[0];
-      const saved = await saveVideo(url, taskId, config, exec.signal);
       const media = data.media && typeof data.media === "object" ? data.media : {};
       if (url) exec.concludeTurn();
       return {
         taskId,
         model,
         generateAudio,
-        ...saved,
+        ...url ? { url } : {},
         ...typeof media.duration_seconds === "number" ? { durationSeconds: media.duration_seconds } : {},
         ...typeof media.width === "number" ? { width: media.width } : {},
         ...typeof media.height === "number" ? { height: media.height } : {},
@@ -1959,9 +1932,8 @@ Video models: ${value.videos.join(", ")}` }]
       const urls = api.urls(data);
       const detectedKind = args.kind && args.kind !== "auto" ? args.kind : data.media && typeof data.media === "object" ? "videos" : urls.some((url) => /\.(?:mp4|webm)(?:\?|$)/i.test(url)) ? "videos" : "images";
       if (detectedKind === "videos") {
-        const saved = await saveVideo(urls[0], args.task_id, config, exec.signal);
         if (urls[0]) exec.concludeTurn();
-        return { taskId: args.task_id, status, progress, kind: "videos", ...saved };
+        return { taskId: args.task_id, status, progress, kind: "videos", ...urls[0] ? { url: urls[0] } : {} };
       }
       const images = await saveImages(urls, args.task_id, attachments, exec.signal);
       if (images.length > 0) exec.concludeTurn();

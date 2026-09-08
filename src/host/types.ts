@@ -11,12 +11,6 @@ export interface GeneratedImage {
   error?: string
 }
 
-export interface GeneratedVideo {
-  url?: string
-  filePath?: string
-  error?: string
-}
-
 export interface MediaConfig {
   baseURL: string
   apiKeyEnv: string

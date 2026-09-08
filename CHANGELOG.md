@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.7
+
+- Stop automatically downloading completed videos to the local output directory.
+- Render completed videos directly from the TokensAPI remote URL, preserving the inline video player for both initial generation and `media_task_status` recovery.
+
 ## 0.3.6
 
 - Add one valid `initialSelected` value to every wizard question with options so compatible TokensCowork clients can render a default selected state without adding recommendation badges.
