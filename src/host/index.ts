@@ -1,5 +1,6 @@
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
@@ -75,6 +76,137 @@ export const Config = Schema.object({
 type AnyRecord = Record<string, any>
 type MediaIntent = 'image_gen' | 'image_edit' | 'video_gen'
 type ReuseCategory = 'prompt' | 'references' | 'settings'
+
+type GenerationPermit = {
+  intent: MediaIntent
+  turnKey: string
+  expectedArgs: AnyRecord
+  expiresAt: number
+}
+
+const GENERATION_CONFIRMATION_TTL_MS = 30 * 60 * 1000
+const sessionScopeIds = new WeakMap<object, string>()
+const cancelledTurnByScope = new Map<string, string>()
+const generationPermits = new Map<string, GenerationPermit>()
+
+function objectScopeId(value: object): string {
+  const existing = sessionScopeIds.get(value)
+  if (existing) return existing
+  const created = randomUUID()
+  sessionScopeIds.set(value, created)
+  return created
+}
+
+function mediaSessionScope(exec: AnyRecord): string | null {
+  const session = exec?.agent?.session
+  const explicit = session?.id ?? session?.sessionId ?? exec?.agent?.sessionId
+  if (typeof explicit === 'string' && explicit.trim()) return `session:${explicit.trim()}`
+  if (typeof explicit === 'number' && Number.isFinite(explicit)) return `session:${explicit}`
+  if (session && typeof session === 'object') return `session-object:${objectScopeId(session)}`
+  if (exec?.agent && typeof exec.agent === 'object') return `agent-object:${objectScopeId(exec.agent)}`
+  return null
+}
+
+function mediaUserTurn(exec: AnyRecord): string | null {
+  const explicit = exec?.turnId ?? exec?.agent?.turnId ?? exec?.agent?.currentTurnId
+  if ((typeof explicit === 'string' && explicit.trim()) || typeof explicit === 'number') return String(explicit)
+  const messages = exec?.agent?.session?.deriveMessages?.()
+  if (!Array.isArray(messages)) return null
+  const humanMessages = messages.filter((message: AnyRecord) => (
+    message?.role === 'user' && !['tool', 'plugin'].includes(message?.source?.kind)
+  ))
+  const latest = humanMessages.at(-1)
+  const messageId = latest?.id ?? latest?.source?.rpcId
+  if ((typeof messageId === 'string' && messageId.trim()) || typeof messageId === 'number') {
+    return `user-message:${String(messageId)}`
+  }
+  return `user-${humanMessages.length}`
+}
+
+function mediaTurnIdentity(exec: AnyRecord): { scope: string; turn: string; key: string } | null {
+  const scope = mediaSessionScope(exec)
+  const turn = mediaUserTurn(exec)
+  return scope && turn ? { scope, turn, key: `${scope}:${turn}` } : null
+}
+
+function markMediaTurnCancelled(exec: AnyRecord): void {
+  const identity = mediaTurnIdentity(exec)
+  if (!identity) return
+  cancelledTurnByScope.set(identity.scope, identity.turn)
+  for (const intent of ['image_gen', 'image_edit', 'video_gen'] as const) {
+    generationPermits.delete(`${identity.key}:${intent}`)
+  }
+}
+
+function isMediaTurnCancelled(exec: AnyRecord): boolean {
+  const identity = mediaTurnIdentity(exec)
+  return Boolean(identity && cancelledTurnByScope.get(identity.scope) === identity.turn)
+}
+
+const GENERATION_ARGUMENT_KEYS: Record<MediaIntent, readonly string[]> = {
+  image_gen: ['prompt', 'model', 'aspect_ratio', 'n'],
+  image_edit: ['prompt', 'image', 'model', 'aspect_ratio', 'n'],
+  video_gen: ['prompt', 'model', 'duration', 'resolution', 'aspect_ratio', 'generate_audio', 'image_url', 'reference_images', 'start_image', 'end_image'],
+}
+
+function generationArguments(intent: MediaIntent, values: AnyRecord): AnyRecord {
+  return Object.fromEntries(GENERATION_ARGUMENT_KEYS[intent]
+    .filter((key) => values[key] !== undefined)
+    .map((key) => [key, values[key]]))
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as AnyRecord)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalValue(item)]))
+  }
+  return value
+}
+
+function sameGenerationArguments(left: AnyRecord, right: AnyRecord): boolean {
+  return JSON.stringify(canonicalValue(left)) === JSON.stringify(canonicalValue(right))
+}
+
+function cleanupGenerationPermits(): void {
+  const now = Date.now()
+  for (const [id, permit] of generationPermits) {
+    if (permit.expiresAt <= now) generationPermits.delete(id)
+  }
+}
+
+function issueGenerationPermit(intent: MediaIntent, params: AnyRecord, exec: AnyRecord): void {
+  cleanupGenerationPermits()
+  const turnKey = mediaTurnIdentity(exec)?.key
+  if (!turnKey) throw new Error('Unable to bind media confirmation to the current user request. No generation task was submitted.')
+  generationPermits.set(`${turnKey}:${intent}`, {
+    intent,
+    turnKey,
+    expectedArgs: generationArguments(intent, params),
+    expiresAt: Date.now() + GENERATION_CONFIRMATION_TTL_MS,
+  })
+}
+
+function assertGenerationPermit(intent: MediaIntent, args: AnyRecord, exec: AnyRecord): void {
+  cleanupGenerationPermits()
+  if (isMediaTurnCancelled(exec)) {
+    throw new Error('This media flow was cancelled. No generation task was submitted. Start a new request to generate media.')
+  }
+  const turnKey = mediaTurnIdentity(exec)?.key
+  const permit = turnKey ? generationPermits.get(`${turnKey}:${intent}`) : undefined
+  if (!permit) {
+    throw new Error('Missing or expired media wizard confirmation for this user request. No generation task was submitted.')
+  }
+  if (permit.intent !== intent || permit.turnKey !== turnKey) {
+    throw new Error('Media wizard confirmation does not belong to this task or user request. No generation task was submitted.')
+  }
+  const actualArgs = generationArguments(intent, args)
+  if (!sameGenerationArguments(permit.expectedArgs, actualArgs)) {
+    throw new Error('Media parameters changed after confirmation. No generation task was submitted; run the wizard again.')
+  }
+}
 
 const VIDEO_ROUTE_PREFIX = '/media-gen/videos'
 const DOWNLOAD_ROUTE = '/media-gen/download'
@@ -221,9 +353,28 @@ function numberLabel(value: unknown): number | undefined {
   return match ? Number(match[1]) : undefined
 }
 
+const MEDIA_QUESTION_ID_PREFIX = 'tokensapi_media__'
+
+function mediaQuestionWireId(question: AnyRecord, index: number): string {
+  const options = Array.isArray(question.options) ? question.options : []
+  const initialSelected = Array.isArray(question.initialSelected) ? question.initialSelected : []
+  const defaultIndex = options.findIndex((option: AnyRecord) => initialSelected.includes(option?.label))
+  return `${MEDIA_QUESTION_ID_PREFIX}q${index}__d${defaultIndex}__${String(question.id)}`
+}
+
 async function ask(ctx: AnyRecord, exec: AnyRecord, questions: AnyRecord[]): Promise<Record<string, AnyRecord>> {
-  const response = await ctx.userQuestions.ask({ questions, ...(exec.agent ? { agent: exec.agent } : {}), signal: exec.signal })
-  return Object.fromEntries((response.answers ?? []).map((answer: AnyRecord) => [answer.id, answer]))
+  const logicalIdByWireId = new Map<string, string>()
+  const wireQuestions = questions.map((question, index) => {
+    const logicalId = String(question.id)
+    const wireId = mediaQuestionWireId(question, index)
+    logicalIdByWireId.set(wireId, logicalId)
+    return { ...question, id: wireId }
+  })
+  const response = await ctx.userQuestions.ask({ questions: wireQuestions, ...(exec.agent ? { agent: exec.agent } : {}), signal: exec.signal })
+  return Object.fromEntries((response.answers ?? []).map((answer: AnyRecord) => {
+    const logicalId = logicalIdByWireId.get(String(answer.id)) ?? String(answer.id)
+    return [logicalId, { ...answer, id: logicalId }]
+  }))
 }
 
 function sessionUserImageRefs(exec: AnyRecord): AnyRecord[] {
@@ -440,6 +591,7 @@ function normalizeWizardKnown(intent: MediaIntent, known: unknown, _exec: AnyRec
   }
   const params: AnyRecord = { ...((known as AnyRecord | undefined) ?? {}) }
   delete params.modelExplicit
+  delete params.confirmation_id
   for (const key of ['prompt', 'originalPrompt', 'promptSource', 'model', 'image', 'aspect_ratio', 'resolution', 'image_url', 'start_image', 'end_image']) {
     trimOptionalString(params, key)
   }
@@ -632,7 +784,7 @@ Known-field contract: prompt is the current requested content or edit; promptSou
 
 Reuse contract: previousTask contains only the most recent completed same-intent task and its final params. reuse contains explicit per-category decisions only when the user already said whether to reuse prompt, references, or settings. Use true for explicit reuse and false for explicit reset. Leave a category absent when the request is ambiguous, such as "generate another video", so the wizard asks. Phrases such as "another identical one" can set all available categories true; "do not reuse anything" can set them false; "change the content but keep other settings" should set prompt false and settings true. Current known values always win over reused values.
 
-The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. If the wizard result has cancelled=true, stop the media flow for this user request: do not reopen the wizard and do not call any media_generate_* tool until the user sends a new request. The plugin tracks successful confirmation internally for the current user request; do not invent or pass a confirmation id. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
 
 Submission safety contract: a network error, HTTP 429, unchanged progress, or a timed-out foreground wait does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, or says the submission status is uncertain, do not call a media_generate_* tool again for that request. Continue with media_task_status when a taskId is known. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`,
   })
@@ -678,30 +830,62 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           modelChoiceConfirmed: { type: 'boolean', required: true },
           modelExplicit: { type: 'boolean', required: true },
           finalConfirmed: { type: 'boolean', required: true },
+          cancelled: { type: 'boolean', required: true },
           needsImage: { type: 'boolean' },
           reuseDecisions: { type: 'object', additionalProperties: true },
           params: { type: 'object', additionalProperties: true, required: true },
         },
       },
-      render: (_args: unknown, value: AnyRecord) => [{
-        type: 'text',
-        text: [
-          value.confirmed ? `Wizard complete (${value.intent})` : `Wizard cancelled (${value.intent})`,
-          `Prompt confirmed: ${value.promptConfirmed ? 'yes' : 'no'}`,
-          `Model choice confirmed: ${value.modelChoiceConfirmed ? 'yes' : 'no'}`,
-          `Model strategy: ${value.modelExplicit ? 'explicit model' : 'plugin default'}`,
-          `Final confirmation: ${value.finalConfirmed ? 'yes' : 'no'}`,
-          `Reuse decisions: ${JSON.stringify(value.reuseDecisions ?? {})}`,
-          `Parameters:\n${JSON.stringify(value.params, null, 2)}`,
-        ].join('\n'),
-      }],
+      render: (_args: unknown, value: AnyRecord) => {
+        return [{
+          type: 'text',
+          text: [
+            value.confirmed ? `Wizard complete (${value.intent})` : `Wizard cancelled (${value.intent})`,
+            `Prompt confirmed: ${value.promptConfirmed ? 'yes' : 'no'}`,
+            `Model choice confirmed: ${value.modelChoiceConfirmed ? 'yes' : 'no'}`,
+            `Model strategy: ${value.modelExplicit ? 'explicit model' : 'plugin default'}`,
+            `Final confirmation: ${value.finalConfirmed ? 'yes' : 'no'}`,
+            `Flow cancelled: ${value.cancelled ? 'yes' : 'no'}`,
+            `Reuse decisions: ${JSON.stringify(value.reuseDecisions ?? {})}`,
+            `Parameters:\n${JSON.stringify(value.params ?? {}, null, 2)}`,
+          ].join('\n'),
+        }]
+      },
     },
     async execute(args: AnyRecord, exec: AnyRecord) {
       const intent = args.intent as MediaIntent
       const params = normalizeWizardKnown(intent, args.known, exec)
       validateWizardKnown(intent, params, config)
-      const contextCandidates = normalizeContextCandidates(intent, args.previousTask)
+      if (isMediaTurnCancelled(exec)) {
+        return {
+          intent,
+          confirmed: false,
+          promptConfirmed: false,
+          modelChoiceConfirmed: false,
+          modelExplicit: false,
+          finalConfirmed: false,
+          cancelled: true,
+          needsImage: false,
+          reuseDecisions: {},
+          params,
+        }
+      }
       const reuseDecisions = normalizeReuseDecisions(args.reuse)
+      let needsImage = false
+      let promptConfirmed = false
+      let modelChoiceConfirmed = false
+      let modelExplicit = false
+      let finalConfirmed = false
+      let cancelled = false
+      const result = () => ({ intent, confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed, promptConfirmed, modelChoiceConfirmed, modelExplicit, finalConfirmed, cancelled, needsImage, reuseDecisions, params })
+      const cancelResult = () => {
+        cancelled = true
+        delete params.confirmation_id
+        markMediaTurnCancelled(exec)
+        return result()
+      }
+      try {
+        const contextCandidates = normalizeContextCandidates(intent, args.previousTask)
       const reusablePrompt = missingReusableValues(params, contextCandidates, ['prompt'])
       const reusableReferences = missingReusableValues(params, contextCandidates, REFERENCE_REUSE_KEYS[intent])
       const reusableSettings = missingReusableValues(params, contextCandidates, SETTINGS_REUSE_KEYS[intent])
@@ -750,13 +934,6 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       validateWizardKnown(intent, params, config)
       const promptProvidedBeforeWizard = Boolean(params.prompt)
       if (promptProvidedBeforeWizard && !params.promptSource) params.promptSource = 'user'
-      let needsImage = false
-      let promptConfirmed = false
-      let modelChoiceConfirmed = false
-      let modelExplicit = false
-      let finalConfirmed = false
-      const result = () => ({ intent, confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed, promptConfirmed, modelChoiceConfirmed, modelExplicit, finalConfirmed, needsImage, reuseDecisions, params })
-      try {
         if (intent === 'image_edit' && !params.image) {
           const imageCount = sessionUserImageRefs(exec).length
           const answers = await ask(ctx, exec, [{
@@ -832,7 +1009,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           const promptAnswers = await ask(ctx, exec, [{ id: 'prompt_confirm', header: '确认增强后 Prompt', question: 'Prompt 已被增强，是否使用增强后的内容？', detail: `原始 Prompt:\n${params.originalPrompt}\n\n增强后 Prompt:\n${params.prompt}`, options: [{ label: '确认增强后 Prompt' }, { label: '取消' }], initialSelected: ['确认增强后 Prompt'] }])
           promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === '确认增强后 Prompt'
         } else promptConfirmed = Boolean(params.prompt)
-        if (!promptConfirmed) return result()
+        if (!promptConfirmed) return cancelResult()
         const selectableModels = supportedModelsForIntent(intent)
         const defaultModel = defaultModelForIntent(intent, config)
         if (params.model) {
@@ -919,9 +1096,11 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           const finalAnswers = await ask(ctx, exec, [{ id: 'final_confirm', header: '最终确认', question: '按以下完整配置创建任务吗？', detail: parameterLines.join('\n'), options: [{ label: '确认生成' }, { label: '取消' }], initialSelected: ['确认生成'] }])
           finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === '确认生成'
         }
+        if (!finalConfirmed) return cancelResult()
+        issueGenerationPermit(intent, params, exec)
         return result()
       } catch (error: any) {
-        if (error?.code === 'ASK_CANCELLED') return result()
+        if (error?.code === 'ASK_CANCELLED') return cancelResult()
         throw error
       }
     }
@@ -949,6 +1128,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       const model = args.model ?? config.defaultImageModel
       if (!args.aspect_ratio) throw new Error('Missing confirmed aspect_ratio; image task was not submitted.')
       if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error('Missing or invalid confirmed n; image task was not submitted.')
+      assertGenerationPermit('image_gen', args, exec)
       validateWizardKnown('image_gen', { ...args, model }, config)
       const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio, n: args.n }
       const taskId = await api.submit('images', body, exec.signal, body)
@@ -978,6 +1158,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       const model = args.model ?? config.defaultEditModel
       if (!args.aspect_ratio) throw new Error('Missing confirmed aspect_ratio; image edit task was not submitted.')
       if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error('Missing or invalid confirmed n; image edit task was not submitted.')
+      assertGenerationPermit('image_edit', args, exec)
       if (!(IMAGE_EDIT_MODELS as readonly string[]).includes(model)) {
         throw new Error(`Model ${model} does not support image editing. Choose image2 or qwen_image.`)
       }
@@ -1072,6 +1253,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       if (capability.audioMode === 'required' && args.generate_audio === false) {
         throw new Error(`${model} requires generated audio to remain enabled.`)
       }
+      assertGenerationPermit('video_gen', args, exec)
       const generateAudio = capability.audioMode === 'required'
         ? true
         : args.generate_audio

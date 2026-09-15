@@ -47,6 +47,12 @@ Local images and current-conversation DSH attachments use first-party storage. S
 
 ## Installation
 
+Install from the TokensAPI private registry for your TokensCowork organization:
+
+```bash
+npm install @tokensapi/dsh-media-gen@0.3.8 --registry=https://npm.tokensapi.ai/
+```
+
 Register the package in the active DSH profile:
 
 ```yaml

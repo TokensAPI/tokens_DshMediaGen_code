@@ -45,6 +45,14 @@ TokensAPI 生产任务接口要求参考图片是公开可访问的 HTTPS URL。
 
 ## 分发与安装
 
+### TokensCowork 组织内部安装
+
+从 TokensAPI 私有 Registry 安装：
+
+```bash
+npm install @tokensapi/dsh-media-gen@0.3.8 --registry=https://npm.tokensapi.ai/
+```
+
 ### 打包方：生成可分发安装包
 
 在插件源码目录执行：

@@ -35,6 +35,7 @@ async function createHarness(answer) {
   const mod = await import('../dist/index.js')
   const tools = new Map()
   const questionCalls = []
+  const wireQuestionCalls = []
   const ctx = {
     effect(register) { return register() },
     webServer: { register() { return () => {} } },
@@ -43,20 +44,202 @@ async function createHarness(answer) {
     systemPrompt: { section() {} },
     userQuestions: {
       async ask(payload) {
-        questionCalls.push(payload.questions)
-        return answer ? answer(payload.questions, questionCalls.length) : { answers: [] }
+        const wireQuestions = payload.questions
+        const logicalQuestions = wireQuestions.map((question) => ({
+          ...question,
+          id: String(question.id).replace(/^tokensapi_media__q\d+__d-?\d+__/, ''),
+        }))
+        wireQuestionCalls.push(wireQuestions)
+        questionCalls.push(logicalQuestions)
+        const response = answer ? await answer(logicalQuestions, questionCalls.length) : { answers: [] }
+        return {
+          ...response,
+          answers: (response.answers ?? []).map((item) => {
+            const wireQuestion = wireQuestions.find((question) => (
+              String(question.id).replace(/^tokensapi_media__q\d+__d-?\d+__/, '') === item.id
+            ))
+            return { ...item, id: wireQuestion?.id ?? item.id }
+          }),
+        }
       },
     },
     credentials: { async resolve() { return undefined } },
     logger: { warn() {} },
   }
   mod.apply(ctx, config)
-  return { mod, tools, questionCalls }
+  return { mod, tools, questionCalls, wireQuestionCalls }
 }
 
 function execContext() {
-  return { signal: new AbortController().signal }
+  return conversationExecution().execution
 }
+
+let sessionSequence = 0
+
+function conversationExecution() {
+  const sequence = ++sessionSequence
+  const messages = [{ role: 'user', source: { kind: 'user' }, id: `user-${sequence}-1`, content: [] }]
+  const session = {
+    id: `test-session-${sequence}`,
+    deriveMessages() { return messages },
+  }
+  let userMessageSequence = 1
+  return {
+    execution: { signal: new AbortController().signal, agent: { session } },
+    addToolResult() { messages.push({ role: 'user', source: { kind: 'tool' }, content: [] }) },
+    addRuntimeSnapshot() { messages.push({ role: 'user', source: { kind: 'plugin' }, content: [] }) },
+    nextUserMessage() {
+      userMessageSequence += 1
+      messages.push({ role: 'user', source: { kind: 'user' }, id: `user-${sequence}-${userMessageSequence}`, content: [] })
+    },
+  }
+}
+
+async function confirmedToolArgs(tools, intent, args, execution = execContext()) {
+  const result = await tools.get('media_wizard').execute({
+    intent,
+    known: {
+      ...args,
+      enhanced: false,
+      skipFinalConfirmation: true,
+      ...(args.model ? {} : { useDefaultModel: true }),
+    },
+  }, execution)
+  assert.equal(result.confirmed, true)
+  assert.equal(result.cancelled, false)
+  assert.equal(result.confirmationId, undefined)
+  assert.equal(result.params.confirmation_id, undefined)
+  return { ...args }
+}
+
+test('closing any wizard stage marks the flow cancelled and issues no confirmation', async () => {
+  const scenarios = [
+    {
+      questionId: 'reuse_prompt',
+      input: {
+        intent: 'image_gen',
+        known: {},
+        previousTask: { intent: 'image_gen', params: { prompt: 'Previous prompt' } },
+      },
+    },
+    { questionId: 'enhance', input: { intent: 'image_gen', known: { prompt: 'Current prompt' } } },
+    { questionId: 'model', input: { intent: 'image_gen', known: { prompt: 'Current prompt', enhanced: false } } },
+    { questionId: 'aspect_ratio', input: { intent: 'image_gen', known: { prompt: 'Current prompt', enhanced: false, model: 'z_image_turbo' } } },
+    { questionId: 'final_confirm', input: { intent: 'image_gen', known: { prompt: 'Current prompt', enhanced: false, model: 'z_image_turbo', aspect_ratio: '16:9', n: 1 } } },
+  ]
+
+  for (const scenario of scenarios) {
+    const { tools } = await createHarness((questions) => {
+      if (questions.some((question) => question.id === scenario.questionId)) {
+        throw Object.assign(new Error('closed by user'), { code: 'ASK_CANCELLED' })
+      }
+      return {
+        answers: questions.map((question) => ({
+          id: question.id,
+          selected: [question.initialSelected?.[0] ?? question.options?.[0]?.label].filter(Boolean),
+        })),
+      }
+    })
+    const { execution } = conversationExecution()
+    const result = await tools.get('media_wizard').execute(scenario.input, execution)
+    assert.equal(result.confirmed, false, scenario.questionId)
+    assert.equal(result.cancelled, true, scenario.questionId)
+    assert.equal(result.confirmationId, undefined, scenario.questionId)
+    assert.equal(result.params.confirmation_id, undefined, scenario.questionId)
+  }
+})
+
+test('closing the wizard blocks generation and reopening until the next user request', async () => {
+  let shouldCancel = true
+  const { mod, tools, questionCalls } = await createHarness((questions) => {
+    if (shouldCancel) {
+      shouldCancel = false
+      throw Object.assign(new Error('closed by user'), { code: 'ASK_CANCELLED' })
+    }
+    return {
+      answers: questions.map((question) => ({
+        id: question.id,
+        selected: [question.initialSelected?.[0] ?? question.options?.[0]?.label].filter(Boolean),
+      })),
+    }
+  })
+  const conversation = conversationExecution()
+  const wizardInput = {
+    intent: 'image_gen',
+    known: { prompt: 'A quiet mountain lake', model: 'z_image_turbo', aspect_ratio: '16:9', n: 1 },
+  }
+  let submissions = 0
+  const originalSubmit = mod.TokensApiClient.prototype.submit
+  const originalPoll = mod.TokensApiClient.prototype.poll
+  mod.TokensApiClient.prototype.submit = async function () {
+    submissions += 1
+    return 'task_after_new_request'
+  }
+  mod.TokensApiClient.prototype.poll = async function () { return { results: [] } }
+
+  try {
+    const cancelled = await tools.get('media_wizard').execute(wizardInput, conversation.execution)
+    assert.equal(cancelled.cancelled, true)
+    const questionCountAfterClose = questionCalls.length
+    conversation.addToolResult()
+    conversation.addRuntimeSnapshot()
+
+    await assert.rejects(() => tools.get('media_generate_image').execute({
+      prompt: 'A quiet mountain lake',
+      model: 'z_image_turbo',
+      aspect_ratio: '16:9',
+      n: 1,
+    }, conversation.execution), /flow was cancelled/)
+    assert.equal(submissions, 0)
+
+    const blockedRestart = await tools.get('media_wizard').execute(wizardInput, conversation.execution)
+    assert.equal(blockedRestart.cancelled, true)
+    assert.equal(questionCalls.length, questionCountAfterClose)
+
+    conversation.nextUserMessage()
+    const confirmed = await tools.get('media_wizard').execute({
+      ...wizardInput,
+      known: { ...wizardInput.known, enhanced: false, skipFinalConfirmation: true },
+    }, conversation.execution)
+    assert.equal(confirmed.confirmed, true)
+    assert.equal(confirmed.cancelled, false)
+    conversation.addToolResult()
+    await tools.get('media_generate_image').execute({
+      prompt: 'A quiet mountain lake',
+      model: 'z_image_turbo',
+      aspect_ratio: '16:9',
+      n: 1,
+    }, conversation.execution)
+    assert.equal(submissions, 1)
+  } finally {
+    mod.TokensApiClient.prototype.submit = originalSubmit
+    mod.TokensApiClient.prototype.poll = originalPoll
+  }
+})
+
+test('generation confirmation is bound to the exact confirmed parameters', async () => {
+  const { mod, tools } = await createHarness()
+  const execution = execContext()
+  const args = await confirmedToolArgs(tools, 'image_gen', {
+    prompt: 'A red fox in snow',
+    model: 'z_image_turbo',
+    aspect_ratio: '16:9',
+    n: 2,
+  }, execution)
+  let submissions = 0
+  const originalSubmit = mod.TokensApiClient.prototype.submit
+  mod.TokensApiClient.prototype.submit = async function () {
+    submissions += 1
+    return 'unexpected_task'
+  }
+
+  try {
+    await assert.rejects(() => tools.get('media_generate_image').execute({ ...args, n: 4 }, execution), /parameters changed after confirmation/)
+    assert.equal(submissions, 0)
+  } finally {
+    mod.TokensApiClient.prototype.submit = originalSubmit
+  }
+})
 
 test('prompt enhancement question shows the complete current prompt and its source', async () => {
   let enhanceQuestion
@@ -359,6 +542,35 @@ test('every option question exposes one valid initial selection without adding r
   )
 })
 
+test('media questions carry a private wire id with an encoded default and answers restore logical ids', async () => {
+  const { tools, wireQuestionCalls } = await createHarness((questions) => ({
+    answers: questions.map((question) => ({
+      id: question.id,
+      selected: question.initialSelected ?? [],
+    })),
+  }))
+  const wizard = tools.get('media_wizard')
+
+  const result = await wizard.execute({
+    intent: 'image_gen',
+    known: { prompt: 'A quiet lake at sunrise' },
+  }, execContext())
+
+  assert.equal(result.confirmed, true)
+  const wireQuestions = wireQuestionCalls.flat()
+  assert.ok(wireQuestions.length > 0)
+  for (const question of wireQuestions) {
+    const match = /^tokensapi_media__q\d+__d(-?\d+)__(.+)$/.exec(question.id)
+    assert.ok(match, `${question.id} should be namespaced for the media composer`)
+    if (!Array.isArray(question.options)) {
+      assert.equal(Number(match[1]), -1)
+      continue
+    }
+    const defaultIndex = Number(match[1])
+    assert.equal(question.options[defaultIndex]?.label, question.initialSelected?.[0])
+  }
+})
+
 test('seedance 2.5 first-frame wizard enforces adaptive ratio and allows disabling audio', async () => {
   let finalDetail = ''
   const { tools, questionCalls } = await createHarness((questions) => {
@@ -483,6 +695,7 @@ test('video generation tool schema accepts the five models and combined video ra
   assert.ok(videoTool.parameters.required.includes('resolution'))
   assert.ok(videoTool.parameters.required.includes('aspect_ratio'))
   assert.ok(videoTool.parameters.required.includes('generate_audio'))
+  assert.equal(videoTool.parameters.required.includes('confirmation_id'), false)
 })
 
 test('image tool schemas require the wizard-confirmed ratio and count', async () => {
@@ -491,6 +704,7 @@ test('image tool schemas require the wizard-confirmed ratio and count', async ()
     const tool = tools.get(name)
     assert.ok(tool.parameters.required.includes('aspect_ratio'))
     assert.ok(tool.parameters.required.includes('n'))
+    assert.equal(tool.parameters.required.includes('confirmation_id'), false)
     assert.deepEqual(tool.parameters.properties.n.enum, [1, 2, 4])
   }
 })
@@ -543,17 +757,21 @@ test('image tools submit the exact confirmed ratio and count', async () => {
   }
 
   try {
-    await tools.get('media_generate_image').execute({
+    const imageExecution = execContext()
+    const imageArgs = await confirmedToolArgs(tools, 'image_gen', {
       prompt: 'A red fox in snow',
       aspect_ratio: '16:9',
       n: 2,
-    }, execContext())
-    await tools.get('media_edit_image').execute({
+    }, imageExecution)
+    await tools.get('media_generate_image').execute(imageArgs, imageExecution)
+    const editExecution = execContext()
+    const editArgs = await confirmedToolArgs(tools, 'image_edit', {
       prompt: 'Make the sky brighter',
       image: 'https://example.com/input.png',
       aspect_ratio: '16:9',
       n: 2,
-    }, execContext())
+    }, editExecution)
+    await tools.get('media_edit_image').execute(editArgs, editExecution)
   } finally {
     mod.TokensApiClient.prototype.submit = originalSubmit
     mod.TokensApiClient.prototype.poll = originalPoll
@@ -613,29 +831,34 @@ test('video request body applies each model audio strategy without network acces
   }
 
   try {
-    const ltx23 = await videoTool.execute({
+    const ltx23Execution = execContext()
+    const ltx23Args = await confirmedToolArgs(tools, 'video_gen', {
       prompt: 'A city at sunrise',
       model: 'ltx_2_3',
       duration: 5,
       resolution: '720p',
       aspect_ratio: '16:9',
       generate_audio: true,
-    }, execContext())
+    }, ltx23Execution)
+    const ltx23 = await videoTool.execute(ltx23Args, ltx23Execution)
     assert.equal(ltx23.generateAudio, true)
     assert.equal('generate_audio' in requests.at(-1).body, false)
 
-    const ltx25 = await videoTool.execute({
+    const ltx25Execution = execContext()
+    const ltx25Args = await confirmedToolArgs(tools, 'video_gen', {
       prompt: 'A cinematic ocean scene',
       model: 'ltx_2_5',
       duration: 5,
       resolution: '1080p',
       aspect_ratio: '16:9',
       generate_audio: true,
-    }, execContext())
+    }, ltx25Execution)
+    const ltx25 = await videoTool.execute(ltx25Args, ltx25Execution)
     assert.equal(ltx25.generateAudio, true)
     assert.equal(requests.at(-1).body.generate_audio, true)
 
-    const seedance25 = await videoTool.execute({
+    const seedance25Execution = execContext()
+    const seedance25Args = await confirmedToolArgs(tools, 'video_gen', {
       prompt: 'Animate the supplied frame',
       model: 'seedance_2_5',
       duration: 5,
@@ -643,20 +866,23 @@ test('video request body applies each model audio strategy without network acces
       generate_audio: false,
       aspect_ratio: 'adaptive',
       start_image: 'https://example.com/start.png',
-    }, execContext())
+    }, seedance25Execution)
+    const seedance25 = await videoTool.execute(seedance25Args, seedance25Execution)
     assert.equal(seedance25.generateAudio, false)
     assert.equal(requests.at(-1).body.generate_audio, false)
     assert.equal(requests.at(-1).body.aspect_ratio, 'adaptive')
     assert.equal(requests.at(-1).body.frame_images[0].frame_type, 'first_frame')
 
-    const h3 = await videoTool.execute({
+    const h3Execution = execContext()
+    const h3Args = await confirmedToolArgs(tools, 'video_gen', {
       prompt: 'A product reveal',
       model: 'minimax_h3',
       duration: 10,
       resolution: '480p',
       aspect_ratio: '3:2',
       generate_audio: true,
-    }, execContext())
+    }, h3Execution)
+    const h3 = await videoTool.execute(h3Args, h3Execution)
     assert.equal(h3.generateAudio, true)
     assert.equal(requests.at(-1).body.generate_audio, true)
   } finally {
@@ -692,7 +918,7 @@ test('completed videos stay remote and render inline without automatic downloads
   const execution = { ...execContext(), concludeTurn() {} }
 
   try {
-    const generated = await videoTool.execute({
+    const generatedArgs = await confirmedToolArgs(tools, 'video_gen', {
       prompt: 'A paper boat crossing a quiet lake',
       model: 'minimax_h3',
       duration: 5,
@@ -700,6 +926,7 @@ test('completed videos stay remote and render inline without automatic downloads
       aspect_ratio: '16:9',
       generate_audio: true,
     }, execution)
+    const generated = await videoTool.execute(generatedArgs, execution)
     assert.equal(generated.url, url)
     assert.equal('filePath' in generated, false)
     assert.equal('error' in generated, false)

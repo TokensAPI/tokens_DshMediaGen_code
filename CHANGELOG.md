@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.8
+
+- Add a TokensCowork 0.5.1-compatible media question composer that visibly selects one default option and lets Space or Enter confirm it.
+- Keep the recommendation marker only on the default model while preserving default selections for Prompt enhancement, history reuse, output parameters, and final confirmation.
+- Make the wizard's Skip action apply the current question's default option and continue instead of returning an empty answer.
+- Make the close button cancel the media wizard at every stage, block reopening or generation for the same user request, and allow a fresh flow only after the next user message.
+- Track successful generation confirmation inside the plugin by session, user request, intent, and exact parameters so models do not need to transfer an internal confirmation ID.
+- Reject missing, expired, cancelled, cross-request, or changed-parameter generation attempts before uploading inputs or calling TokensAPI.
+- Add cancellation, skip-default, confirmation-binding, injected-message, and TokensCowork 0.5.1 regression coverage without making paid production requests.
+
 ## 0.3.7
 
 - Stop automatically downloading completed videos to the local output directory.

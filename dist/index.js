@@ -1,6 +1,7 @@
 // src/host/index.ts
 import Schema from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { createReadStream } from "node:fs";
 import { stat as stat2 } from "node:fs/promises";
@@ -836,6 +837,109 @@ var Config = Schema.object({
   r2CdnBase: Schema.string().default(""),
   r2PathPrefix: Schema.string().default("inputs")
 });
+var GENERATION_CONFIRMATION_TTL_MS = 30 * 60 * 1e3;
+var sessionScopeIds = /* @__PURE__ */ new WeakMap();
+var cancelledTurnByScope = /* @__PURE__ */ new Map();
+var generationPermits = /* @__PURE__ */ new Map();
+function objectScopeId(value) {
+  const existing = sessionScopeIds.get(value);
+  if (existing) return existing;
+  const created = randomUUID();
+  sessionScopeIds.set(value, created);
+  return created;
+}
+function mediaSessionScope(exec) {
+  const session = exec?.agent?.session;
+  const explicit = session?.id ?? session?.sessionId ?? exec?.agent?.sessionId;
+  if (typeof explicit === "string" && explicit.trim()) return `session:${explicit.trim()}`;
+  if (typeof explicit === "number" && Number.isFinite(explicit)) return `session:${explicit}`;
+  if (session && typeof session === "object") return `session-object:${objectScopeId(session)}`;
+  if (exec?.agent && typeof exec.agent === "object") return `agent-object:${objectScopeId(exec.agent)}`;
+  return null;
+}
+function mediaUserTurn(exec) {
+  const explicit = exec?.turnId ?? exec?.agent?.turnId ?? exec?.agent?.currentTurnId;
+  if (typeof explicit === "string" && explicit.trim() || typeof explicit === "number") return String(explicit);
+  const messages = exec?.agent?.session?.deriveMessages?.();
+  if (!Array.isArray(messages)) return null;
+  const humanMessages = messages.filter((message) => message?.role === "user" && !["tool", "plugin"].includes(message?.source?.kind));
+  const latest = humanMessages.at(-1);
+  const messageId = latest?.id ?? latest?.source?.rpcId;
+  if (typeof messageId === "string" && messageId.trim() || typeof messageId === "number") {
+    return `user-message:${String(messageId)}`;
+  }
+  return `user-${humanMessages.length}`;
+}
+function mediaTurnIdentity(exec) {
+  const scope = mediaSessionScope(exec);
+  const turn = mediaUserTurn(exec);
+  return scope && turn ? { scope, turn, key: `${scope}:${turn}` } : null;
+}
+function markMediaTurnCancelled(exec) {
+  const identity = mediaTurnIdentity(exec);
+  if (!identity) return;
+  cancelledTurnByScope.set(identity.scope, identity.turn);
+  for (const intent of ["image_gen", "image_edit", "video_gen"]) {
+    generationPermits.delete(`${identity.key}:${intent}`);
+  }
+}
+function isMediaTurnCancelled(exec) {
+  const identity = mediaTurnIdentity(exec);
+  return Boolean(identity && cancelledTurnByScope.get(identity.scope) === identity.turn);
+}
+var GENERATION_ARGUMENT_KEYS = {
+  image_gen: ["prompt", "model", "aspect_ratio", "n"],
+  image_edit: ["prompt", "image", "model", "aspect_ratio", "n"],
+  video_gen: ["prompt", "model", "duration", "resolution", "aspect_ratio", "generate_audio", "image_url", "reference_images", "start_image", "end_image"]
+};
+function generationArguments(intent, values) {
+  return Object.fromEntries(GENERATION_ARGUMENT_KEYS[intent].filter((key) => values[key] !== void 0).map((key) => [key, values[key]]));
+}
+function canonicalValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== void 0).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonicalValue(item)]));
+  }
+  return value;
+}
+function sameGenerationArguments(left, right) {
+  return JSON.stringify(canonicalValue(left)) === JSON.stringify(canonicalValue(right));
+}
+function cleanupGenerationPermits() {
+  const now = Date.now();
+  for (const [id, permit] of generationPermits) {
+    if (permit.expiresAt <= now) generationPermits.delete(id);
+  }
+}
+function issueGenerationPermit(intent, params, exec) {
+  cleanupGenerationPermits();
+  const turnKey = mediaTurnIdentity(exec)?.key;
+  if (!turnKey) throw new Error("Unable to bind media confirmation to the current user request. No generation task was submitted.");
+  generationPermits.set(`${turnKey}:${intent}`, {
+    intent,
+    turnKey,
+    expectedArgs: generationArguments(intent, params),
+    expiresAt: Date.now() + GENERATION_CONFIRMATION_TTL_MS
+  });
+}
+function assertGenerationPermit(intent, args, exec) {
+  cleanupGenerationPermits();
+  if (isMediaTurnCancelled(exec)) {
+    throw new Error("This media flow was cancelled. No generation task was submitted. Start a new request to generate media.");
+  }
+  const turnKey = mediaTurnIdentity(exec)?.key;
+  const permit = turnKey ? generationPermits.get(`${turnKey}:${intent}`) : void 0;
+  if (!permit) {
+    throw new Error("Missing or expired media wizard confirmation for this user request. No generation task was submitted.");
+  }
+  if (permit.intent !== intent || permit.turnKey !== turnKey) {
+    throw new Error("Media wizard confirmation does not belong to this task or user request. No generation task was submitted.");
+  }
+  const actualArgs = generationArguments(intent, args);
+  if (!sameGenerationArguments(permit.expectedArgs, actualArgs)) {
+    throw new Error("Media parameters changed after confirmation. No generation task was submitted; run the wizard again.");
+  }
+}
 var VIDEO_ROUTE_PREFIX = "/media-gen/videos";
 var DOWNLOAD_ROUTE = "/media-gen/download";
 function safeDownloadName(url, requestedName) {
@@ -992,9 +1096,26 @@ function numberLabel(value) {
   const match = String(value ?? "").match(/^\s*(\d+)/);
   return match ? Number(match[1]) : void 0;
 }
+var MEDIA_QUESTION_ID_PREFIX = "tokensapi_media__";
+function mediaQuestionWireId(question, index) {
+  const options = Array.isArray(question.options) ? question.options : [];
+  const initialSelected = Array.isArray(question.initialSelected) ? question.initialSelected : [];
+  const defaultIndex = options.findIndex((option) => initialSelected.includes(option?.label));
+  return `${MEDIA_QUESTION_ID_PREFIX}q${index}__d${defaultIndex}__${String(question.id)}`;
+}
 async function ask(ctx, exec, questions) {
-  const response = await ctx.userQuestions.ask({ questions, ...exec.agent ? { agent: exec.agent } : {}, signal: exec.signal });
-  return Object.fromEntries((response.answers ?? []).map((answer) => [answer.id, answer]));
+  const logicalIdByWireId = /* @__PURE__ */ new Map();
+  const wireQuestions = questions.map((question, index) => {
+    const logicalId = String(question.id);
+    const wireId = mediaQuestionWireId(question, index);
+    logicalIdByWireId.set(wireId, logicalId);
+    return { ...question, id: wireId };
+  });
+  const response = await ctx.userQuestions.ask({ questions: wireQuestions, ...exec.agent ? { agent: exec.agent } : {}, signal: exec.signal });
+  return Object.fromEntries((response.answers ?? []).map((answer) => {
+    const logicalId = logicalIdByWireId.get(String(answer.id)) ?? String(answer.id);
+    return [logicalId, { ...answer, id: logicalId }];
+  }));
 }
 function sessionUserImageRefs(exec) {
   const messages = exec.agent?.session?.deriveMessages?.() ?? [];
@@ -1182,6 +1303,7 @@ function normalizeWizardKnown(intent, known, _exec) {
   }
   const params = { ...known ?? {} };
   delete params.modelExplicit;
+  delete params.confirmation_id;
   for (const key of ["prompt", "originalPrompt", "promptSource", "model", "image", "aspect_ratio", "resolution", "image_url", "start_image", "end_image"]) {
     trimOptionalString(params, key);
   }
@@ -1364,7 +1486,7 @@ Known-field contract: prompt is the current requested content or edit; promptSou
 
 Reuse contract: previousTask contains only the most recent completed same-intent task and its final params. reuse contains explicit per-category decisions only when the user already said whether to reuse prompt, references, or settings. Use true for explicit reuse and false for explicit reset. Leave a category absent when the request is ambiguous, such as "generate another video", so the wizard asks. Phrases such as "another identical one" can set all available categories true; "do not reuse anything" can set them false; "change the content but keep other settings" should set prompt false and settings true. Current known values always win over reused values.
 
-The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. If the wizard result has cancelled=true, stop the media flow for this user request: do not reopen the wizard and do not call any media_generate_* tool until the user sends a new request. The plugin tracks successful confirmation internally for the current user request; do not invent or pass a confirmation id. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
 
 Submission safety contract: a network error, HTTP 429, unchanged progress, or a timed-out foreground wait does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, or says the submission status is uncertain, do not call a media_generate_* tool again for that request. Continue with media_task_status when a taskId is known. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`
   });
@@ -1409,92 +1531,117 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           modelChoiceConfirmed: { type: "boolean", required: true },
           modelExplicit: { type: "boolean", required: true },
           finalConfirmed: { type: "boolean", required: true },
+          cancelled: { type: "boolean", required: true },
           needsImage: { type: "boolean" },
           reuseDecisions: { type: "object", additionalProperties: true },
           params: { type: "object", additionalProperties: true, required: true }
         }
       },
-      render: (_args, value) => [{
-        type: "text",
-        text: [
-          value.confirmed ? `Wizard complete (${value.intent})` : `Wizard cancelled (${value.intent})`,
-          `Prompt confirmed: ${value.promptConfirmed ? "yes" : "no"}`,
-          `Model choice confirmed: ${value.modelChoiceConfirmed ? "yes" : "no"}`,
-          `Model strategy: ${value.modelExplicit ? "explicit model" : "plugin default"}`,
-          `Final confirmation: ${value.finalConfirmed ? "yes" : "no"}`,
-          `Reuse decisions: ${JSON.stringify(value.reuseDecisions ?? {})}`,
-          `Parameters:
-${JSON.stringify(value.params, null, 2)}`
-        ].join("\n")
-      }]
+      render: (_args, value) => {
+        return [{
+          type: "text",
+          text: [
+            value.confirmed ? `Wizard complete (${value.intent})` : `Wizard cancelled (${value.intent})`,
+            `Prompt confirmed: ${value.promptConfirmed ? "yes" : "no"}`,
+            `Model choice confirmed: ${value.modelChoiceConfirmed ? "yes" : "no"}`,
+            `Model strategy: ${value.modelExplicit ? "explicit model" : "plugin default"}`,
+            `Final confirmation: ${value.finalConfirmed ? "yes" : "no"}`,
+            `Flow cancelled: ${value.cancelled ? "yes" : "no"}`,
+            `Reuse decisions: ${JSON.stringify(value.reuseDecisions ?? {})}`,
+            `Parameters:
+${JSON.stringify(value.params ?? {}, null, 2)}`
+          ].join("\n")
+        }];
+      }
     },
     async execute(args, exec) {
       const intent = args.intent;
       const params = normalizeWizardKnown(intent, args.known, exec);
       validateWizardKnown(intent, params, config);
-      const contextCandidates = normalizeContextCandidates(intent, args.previousTask);
+      if (isMediaTurnCancelled(exec)) {
+        return {
+          intent,
+          confirmed: false,
+          promptConfirmed: false,
+          modelChoiceConfirmed: false,
+          modelExplicit: false,
+          finalConfirmed: false,
+          cancelled: true,
+          needsImage: false,
+          reuseDecisions: {},
+          params
+        };
+      }
       const reuseDecisions = normalizeReuseDecisions(args.reuse);
-      const reusablePrompt = missingReusableValues(params, contextCandidates, ["prompt"]);
-      const reusableReferences = missingReusableValues(params, contextCandidates, REFERENCE_REUSE_KEYS[intent]);
-      const reusableSettings = missingReusableValues(params, contextCandidates, SETTINGS_REUSE_KEYS[intent]);
-      const reuseQuestions = [];
-      if (Object.keys(reusablePrompt).length && reuseDecisions.prompt === void 0) {
-        reuseQuestions.push({
-          id: "reuse_prompt",
-          header: "\u5386\u53F2 Prompt",
-          question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684 Prompt\uFF1F",
-          detail: `\u4E0A\u6B21 Prompt\uFF1A${truncatedPrompt(reusablePrompt.prompt)}`,
-          options: [{ label: "\u4E0D\u590D\u7528", description: "\u6309\u672C\u6B21\u65B0\u4EFB\u52A1\u91CD\u65B0\u586B\u5199 Prompt" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684 Prompt" }],
-          initialSelected: ["\u590D\u7528"]
-        });
-      }
-      if (Object.keys(reusableReferences).length && reuseDecisions.references === void 0) {
-        reuseQuestions.push({
-          id: "reuse_references",
-          header: "\u5386\u53F2\u53C2\u8003\u7D20\u6750",
-          question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u53C2\u8003\u56FE\u6216\u9996\u5C3E\u5E27\uFF1F",
-          detail: reusableReferenceDetail(intent, reusableReferences),
-          options: [{ label: "\u4E0D\u590D\u7528", description: "\u672C\u6B21\u4E0D\u4F7F\u7528\u5386\u53F2\u53C2\u8003\u7D20\u6750" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u53C2\u8003\u7D20\u6750" }],
-          initialSelected: ["\u590D\u7528"]
-        });
-      }
-      if (Object.keys(reusableSettings).length && reuseDecisions.settings === void 0) {
-        reuseQuestions.push({
-          id: "reuse_settings",
-          header: "\u5386\u53F2\u751F\u6210\u53C2\u6570",
-          question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u751F\u6210\u53C2\u6570\uFF1F",
-          detail: reusableSettingsDetail(reusableSettings),
-          options: [{ label: "\u4E0D\u590D\u7528", description: "\u91CD\u65B0\u9009\u62E9\u6A21\u578B\u548C\u8F93\u51FA\u53C2\u6570" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u53EF\u517C\u5BB9\u7684\u6A21\u578B\u548C\u8F93\u51FA\u53C2\u6570" }],
-          initialSelected: ["\u590D\u7528"]
-        });
-      }
-      if (reuseQuestions.length) {
-        const answers = await ask(ctx, exec, reuseQuestions);
-        if (answers.reuse_prompt) reuseDecisions.prompt = stripRecommended(selected(answers.reuse_prompt)) === "\u590D\u7528";
-        if (answers.reuse_references) reuseDecisions.references = stripRecommended(selected(answers.reuse_references)) === "\u590D\u7528";
-        if (answers.reuse_settings) reuseDecisions.settings = stripRecommended(selected(answers.reuse_settings)) === "\u590D\u7528";
-      }
-      if (reuseDecisions.prompt === true) {
-        mergeReusableValues(params, reusablePrompt);
-        if (reusablePrompt.prompt && !params.promptSource) params.promptSource = "reused";
-      }
-      if (reuseDecisions.references === true) mergeReusableValues(params, reusableReferences);
-      const reusedSettingKeys = /* @__PURE__ */ new Set();
-      if (reuseDecisions.settings === true) {
-        mergeReusableValues(params, reusableSettings);
-        for (const key of Object.keys(reusableSettings)) reusedSettingKeys.add(key);
-        pruneIncompatibleReusedSettings(intent, params, reusedSettingKeys, config);
-      }
-      validateWizardKnown(intent, params, config);
-      const promptProvidedBeforeWizard = Boolean(params.prompt);
-      if (promptProvidedBeforeWizard && !params.promptSource) params.promptSource = "user";
       let needsImage = false;
       let promptConfirmed = false;
       let modelChoiceConfirmed = false;
       let modelExplicit = false;
       let finalConfirmed = false;
-      const result = () => ({ intent, confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed, promptConfirmed, modelChoiceConfirmed, modelExplicit, finalConfirmed, needsImage, reuseDecisions, params });
+      let cancelled = false;
+      const result = () => ({ intent, confirmed: promptConfirmed && modelChoiceConfirmed && finalConfirmed, promptConfirmed, modelChoiceConfirmed, modelExplicit, finalConfirmed, cancelled, needsImage, reuseDecisions, params });
+      const cancelResult = () => {
+        cancelled = true;
+        delete params.confirmation_id;
+        markMediaTurnCancelled(exec);
+        return result();
+      };
       try {
+        const contextCandidates = normalizeContextCandidates(intent, args.previousTask);
+        const reusablePrompt = missingReusableValues(params, contextCandidates, ["prompt"]);
+        const reusableReferences = missingReusableValues(params, contextCandidates, REFERENCE_REUSE_KEYS[intent]);
+        const reusableSettings = missingReusableValues(params, contextCandidates, SETTINGS_REUSE_KEYS[intent]);
+        const reuseQuestions = [];
+        if (Object.keys(reusablePrompt).length && reuseDecisions.prompt === void 0) {
+          reuseQuestions.push({
+            id: "reuse_prompt",
+            header: "\u5386\u53F2 Prompt",
+            question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684 Prompt\uFF1F",
+            detail: `\u4E0A\u6B21 Prompt\uFF1A${truncatedPrompt(reusablePrompt.prompt)}`,
+            options: [{ label: "\u4E0D\u590D\u7528", description: "\u6309\u672C\u6B21\u65B0\u4EFB\u52A1\u91CD\u65B0\u586B\u5199 Prompt" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684 Prompt" }],
+            initialSelected: ["\u590D\u7528"]
+          });
+        }
+        if (Object.keys(reusableReferences).length && reuseDecisions.references === void 0) {
+          reuseQuestions.push({
+            id: "reuse_references",
+            header: "\u5386\u53F2\u53C2\u8003\u7D20\u6750",
+            question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u53C2\u8003\u56FE\u6216\u9996\u5C3E\u5E27\uFF1F",
+            detail: reusableReferenceDetail(intent, reusableReferences),
+            options: [{ label: "\u4E0D\u590D\u7528", description: "\u672C\u6B21\u4E0D\u4F7F\u7528\u5386\u53F2\u53C2\u8003\u7D20\u6750" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u53C2\u8003\u7D20\u6750" }],
+            initialSelected: ["\u590D\u7528"]
+          });
+        }
+        if (Object.keys(reusableSettings).length && reuseDecisions.settings === void 0) {
+          reuseQuestions.push({
+            id: "reuse_settings",
+            header: "\u5386\u53F2\u751F\u6210\u53C2\u6570",
+            question: "\u662F\u5426\u590D\u7528\u4E0A\u4E00\u6B21\u4EFB\u52A1\u7684\u751F\u6210\u53C2\u6570\uFF1F",
+            detail: reusableSettingsDetail(reusableSettings),
+            options: [{ label: "\u4E0D\u590D\u7528", description: "\u91CD\u65B0\u9009\u62E9\u6A21\u578B\u548C\u8F93\u51FA\u53C2\u6570" }, { label: "\u590D\u7528", description: "\u6CBF\u7528\u53EF\u517C\u5BB9\u7684\u6A21\u578B\u548C\u8F93\u51FA\u53C2\u6570" }],
+            initialSelected: ["\u590D\u7528"]
+          });
+        }
+        if (reuseQuestions.length) {
+          const answers = await ask(ctx, exec, reuseQuestions);
+          if (answers.reuse_prompt) reuseDecisions.prompt = stripRecommended(selected(answers.reuse_prompt)) === "\u590D\u7528";
+          if (answers.reuse_references) reuseDecisions.references = stripRecommended(selected(answers.reuse_references)) === "\u590D\u7528";
+          if (answers.reuse_settings) reuseDecisions.settings = stripRecommended(selected(answers.reuse_settings)) === "\u590D\u7528";
+        }
+        if (reuseDecisions.prompt === true) {
+          mergeReusableValues(params, reusablePrompt);
+          if (reusablePrompt.prompt && !params.promptSource) params.promptSource = "reused";
+        }
+        if (reuseDecisions.references === true) mergeReusableValues(params, reusableReferences);
+        const reusedSettingKeys = /* @__PURE__ */ new Set();
+        if (reuseDecisions.settings === true) {
+          mergeReusableValues(params, reusableSettings);
+          for (const key of Object.keys(reusableSettings)) reusedSettingKeys.add(key);
+          pruneIncompatibleReusedSettings(intent, params, reusedSettingKeys, config);
+        }
+        validateWizardKnown(intent, params, config);
+        const promptProvidedBeforeWizard = Boolean(params.prompt);
+        if (promptProvidedBeforeWizard && !params.promptSource) params.promptSource = "user";
         if (intent === "image_edit" && !params.image) {
           const imageCount = sessionUserImageRefs(exec).length;
           const answers = await ask(ctx, exec, [{
@@ -1583,7 +1730,7 @@ ${params.originalPrompt}
 ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" }, { label: "\u53D6\u6D88" }], initialSelected: ["\u786E\u8BA4\u589E\u5F3A\u540E Prompt"] }]);
           promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === "\u786E\u8BA4\u589E\u5F3A\u540E Prompt";
         } else promptConfirmed = Boolean(params.prompt);
-        if (!promptConfirmed) return result();
+        if (!promptConfirmed) return cancelResult();
         const selectableModels = supportedModelsForIntent(intent);
         const defaultModel = defaultModelForIntent(intent, config);
         if (params.model) {
@@ -1671,9 +1818,11 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
           const finalAnswers = await ask(ctx, exec, [{ id: "final_confirm", header: "\u6700\u7EC8\u786E\u8BA4", question: "\u6309\u4EE5\u4E0B\u5B8C\u6574\u914D\u7F6E\u521B\u5EFA\u4EFB\u52A1\u5417\uFF1F", detail: parameterLines.join("\n"), options: [{ label: "\u786E\u8BA4\u751F\u6210" }, { label: "\u53D6\u6D88" }], initialSelected: ["\u786E\u8BA4\u751F\u6210"] }]);
           finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === "\u786E\u8BA4\u751F\u6210";
         }
+        if (!finalConfirmed) return cancelResult();
+        issueGenerationPermit(intent, params, exec);
         return result();
       } catch (error) {
-        if (error?.code === "ASK_CANCELLED") return result();
+        if (error?.code === "ASK_CANCELLED") return cancelResult();
         throw error;
       }
     }
@@ -1700,6 +1849,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       const model = args.model ?? config.defaultImageModel;
       if (!args.aspect_ratio) throw new Error("Missing confirmed aspect_ratio; image task was not submitted.");
       if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error("Missing or invalid confirmed n; image task was not submitted.");
+      assertGenerationPermit("image_gen", args, exec);
       validateWizardKnown("image_gen", { ...args, model }, config);
       const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio, n: args.n };
       const taskId = await api.submit("images", body, exec.signal, body);
@@ -1728,6 +1878,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       const model = args.model ?? config.defaultEditModel;
       if (!args.aspect_ratio) throw new Error("Missing confirmed aspect_ratio; image edit task was not submitted.");
       if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error("Missing or invalid confirmed n; image edit task was not submitted.");
+      assertGenerationPermit("image_edit", args, exec);
       if (!IMAGE_EDIT_MODELS.includes(model)) {
         throw new Error(`Model ${model} does not support image editing. Choose image2 or qwen_image.`);
       }
@@ -1820,6 +1971,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       if (capability.audioMode === "required" && args.generate_audio === false) {
         throw new Error(`${model} requires generated audio to remain enabled.`);
       }
+      assertGenerationPermit("video_gen", args, exec);
       const generateAudio = capability.audioMode === "required" ? true : args.generate_audio;
       validateWizardKnown("video_gen", {
         ...args,
