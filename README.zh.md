@@ -6,12 +6,13 @@
 
 ## 兼容性
 
-`0.3.x` 系列锁定并验证：
+版本 `0.3.9` 声明兼容受支持 TokensCowork 版本使用的 DSH 运行时：
 
-- DeepSeek Harness / DSH `0.1.0-rc.8`
+- DeepSeek Harness / DSH `0.1.0-rc.8`、`0.1.3-alpha.1` 和 `^0.1.5-rc.2`
+- Cordis `>=4.0.1 <5`
 - Node.js `^22.19.0 || >=24.0.0`
 
-其他 DSH 版本尚未承诺兼容。
+客户端包不需要已经废弃、且 TokensCowork 0.5.1 不再提供的 `@deepseek-ai/dsh-client-runtime` peer。其他 DSH 预发布版本线尚未承诺兼容。
 
 ## 功能
 
@@ -278,7 +279,7 @@ pnpm run pack:dry
 
 ## 已知限制
 
-- 首版只验证 DSH `0.1.0-rc.8`；
+- 版本 `0.3.9` 支持上方声明的 DSH 运行时版本线；其他预发布版本线需要单独验证；
 - 视频历史播放器要求本地 MP4 仍保留在配置的 `outputDir`；文件缺失时回退 TokensAPI 外部 URL；
 - 当前公开生产任务接口不直接接受 Data URL；本地图片需要 TokensAPI 第一方上传端点；
 - 提交恢复状态目前只保存在插件进程内，不写入本地任务日志。重启 DSH/TokensCowork 后，尚未取得 `task_id` 的不确定提交无法自动恢复；已经保留在对话中的任务 ID 仍可手动查询；

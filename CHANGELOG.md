@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.9
+
+- Add explicit peer compatibility for the DSH runtime lines used by legacy TokensCowork, the intermediate alpha runtime, and TokensCowork 0.5.1.
+- Remove the obsolete `@deepseek-ai/dsh-client-runtime` client injection and peer dependency; the media client bundle does not import it, and TokensCowork 0.5.1 no longer ships it.
+- Declare the supported DSH engine range and Cordis 4.x peer range for install-time and compatibility-check validation.
+- Add package-metadata regression coverage for the supported peer ranges and removed runtime dependency.
+
 ## 0.3.8
 
 - Add a TokensCowork 0.5.1-compatible media question composer that visibly selects one default option and lets Space or Enter confirm it.

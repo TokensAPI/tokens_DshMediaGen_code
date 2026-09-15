@@ -6,12 +6,13 @@ This package is maintained under the `@tokensapi` npm scope and is derived from 
 
 ## Compatibility
 
-The `0.3.x` series targets and is validated against:
+Version `0.3.9` declares compatibility with the DSH runtime lines used by supported TokensCowork releases:
 
-- DeepSeek Harness / DSH `0.1.0-rc.8`
+- DeepSeek Harness / DSH `0.1.0-rc.8`, `0.1.3-alpha.1`, and `^0.1.5-rc.2`
+- Cordis `>=4.0.1 <5`
 - Node.js `^22.19.0 || >=24.0.0`
 
-Other DSH versions are not yet guaranteed.
+The obsolete `@deepseek-ai/dsh-client-runtime` peer is not required by the client bundle and is not present in TokensCowork 0.5.1. Other DSH prerelease lines are not yet guaranteed.
 
 ## Features
 
@@ -104,7 +105,7 @@ pnpm run pack:dry
 
 ## Limitations
 
-- Only DSH `0.1.0-rc.8` is supported by the initial release.
+- Version `0.3.9` supports the declared DSH runtime lines above; other prerelease lines require separate validation.
 - DSH `rc.8` has no video attachment type. The plugin therefore serves saved MP4 files through a restricted same-origin `/media-gen/videos/` route with byte-range support; remote TokensAPI URLs remain the fallback.
 - Public generation task endpoints do not directly accept Data URLs. Local images are converted and sent through TokensAPI presigned object storage before task submission.
 - Submission recovery state is currently process-local and is not written to a task journal. Restarting DSH/TokensCowork clears uncertain submissions that never returned a `task_id`; known task IDs remain recoverable when retained in conversation history.

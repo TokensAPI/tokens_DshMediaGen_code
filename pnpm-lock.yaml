@@ -8,23 +8,23 @@ importers:
 
   .:
     dependencies:
+      '@deepseek-ai/cordis':
+        specifier: '>=4.0.1 <5'
+        version: 4.0.1
       '@deepseek-ai/dsh-client-locale':
-        specifier: 0.1.0-rc.8
+        specifier: 0.1.0-rc.8 || 0.1.3-alpha.1 || ^0.1.5-rc.2
         version: 0.1.0-rc.8(453c7063ea05c0099665fd03f72a5a15)
-      '@deepseek-ai/dsh-client-runtime':
-        specifier: 0.1.0-rc.8
-        version: 0.1.0-rc.8(0e60b9f95af714a85e67a98df3af0bfd)
       '@deepseek-ai/dsh-client-ui-conversation':
-        specifier: 0.1.0-rc.8
+        specifier: 0.1.0-rc.8 || 0.1.3-alpha.1 || ^0.1.5-rc.2
         version: 0.1.0-rc.8(69f512d5d94bef85ee1384e69b5079f1)
       '@deepseek-ai/dsh-client-ui-tool':
-        specifier: 0.1.0-rc.8
+        specifier: 0.1.0-rc.8 || 0.1.3-alpha.1 || ^0.1.5-rc.2
         version: 0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-api-remotes@0.1.0-rc.8(595254fcd6f0e2eefb415cb6827720e3))(@deepseek-ai/dsh-client-connection@0.1.0-rc.8)(@deepseek-ai/dsh-client-locale@0.1.0-rc.8(453c7063ea05c0099665fd03f72a5a15))(@deepseek-ai/dsh-client-runtime@0.1.0-rc.8(0e60b9f95af714a85e67a98df3af0bfd))(@deepseek-ai/dsh-client-ui-conversation@0.1.0-rc.8(69f512d5d94bef85ee1384e69b5079f1))(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1))
       '@deepseek-ai/dsh-credentials':
-        specifier: 0.1.0-rc.8
+        specifier: 0.1.0-rc.8 || 0.1.3-alpha.1 || ^0.1.5-rc.2
         version: 0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-brand@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1)))(@deepseek-ai/dsh-invariants@0.1.0-rc.8(@deepseek-ai/cordis@4.0.1))
       '@deepseek-ai/dsh-tools':
-        specifier: 0.1.0-rc.8
+        specifier: 0.1.0-rc.8 || 0.1.3-alpha.1 || ^0.1.5-rc.2
         version: 0.1.0-rc.8(ac9081d1e007de8a90a707560a8ae1c3)
       '@deepseek-ai/schemastery':
         specifier: ^3.18.1
