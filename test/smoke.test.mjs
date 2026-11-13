@@ -30,9 +30,10 @@ test('package metadata covers supported TokensCowork runtimes without the obsole
     '@deepseek-ai/dsh-client-ui-tool',
   ]
 
-  assert.equal(pkg.version, '0.3.11')
-  assert.equal(pkg.engines.dsh, supportedRange)
+  assert.equal(pkg.version, '0.3.12')
+  assert.ok(pkg.files.includes('docs/tokenscowork-0.5.25-0.7.13-compatibility.md'))
   assert.equal(pkg.dsh.engine, supportedRange)
+  assert.equal(pkg.engines.dsh, supportedRange)
   assert.equal(pkg.peerDependencies['@deepseek-ai/cordis'], '>=4.0.1 <5')
   for (const name of runtimePeers) assert.equal(pkg.peerDependencies[name], supportedRange)
   assert.equal(pkg.peerDependencies['@deepseek-ai/dsh-client-runtime'], undefined)
@@ -42,7 +43,7 @@ test('package metadata covers supported TokensCowork runtimes without the obsole
 test('client bundle exposes per-image downloads through the safe host route', async () => {
   const client = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
   assert.match(client, /\/media-gen\/download\?url=/)
-  assert.match(client, /'aria-label': '下载图片'/)
+  assert.match(client, /'aria-label': mediaText\(t, 'card\.downloadImage'\)/)
   assert.match(client, /M12 3v11m0 0 4-4/)
   assert.match(client, /download: filename/)
   assert.match(client, /compactDownloadTimestamp/)
@@ -53,6 +54,12 @@ test('client bundle exposes per-image downloads through the safe host route', as
 test('client bundle owns only namespaced media option questions and initializes their defaults', async () => {
   const client = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
   assert.match(client, /MEDIA_QUESTION_ID_PREFIX = 'tokensapi_media__'/)
+  assert.match(client, /MEDIA_LOCALE_NS = 'tokensapi\.media-gen'/)
+  assert.match(client, /locale\.register\(MEDIA_LOCALE_NS, MEDIA_MESSAGES\)/)
+  assert.match(client, /var inject = \['slots', 'sessions', 'locale', 'uiConversation'\]/)
+  assert.match(client, /uiConversation\.events\.register\(mediaImageResultDefinition\(\)\)/)
+  assert.match(client, /key: MEDIA_IMAGE_RESULT_NODE/)
+  assert.match(client, /groupTree: 'turn'/)
   assert.match(client, /priority: -100/)
   assert.match(client, /isMediaOptionQuestionPending\(pendingInteraction\)/)
   assert.match(client, /questions\.map\(initialMediaQuestionDraft\)/)

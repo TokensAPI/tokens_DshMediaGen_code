@@ -900,15 +900,19 @@ test('completed videos stay remote and render inline without automatic downloads
   const statusTool = tools.get('media_task_status')
   const url = 'https://cdn.example.com/generated/video.mp4'
   let downloadAttempts = 0
+  let pollCalls = 0
+  let statusCalls = 0
   const originalSubmit = mod.TokensApiClient.prototype.submit
   const originalPoll = mod.TokensApiClient.prototype.poll
   const originalStatus = mod.TokensApiClient.prototype.status
   const originalFetch = globalThis.fetch
   mod.TokensApiClient.prototype.submit = async function () { return 'task_video_inline' }
   mod.TokensApiClient.prototype.poll = async function () {
+    pollCalls += 1
     return { status: 'succeeded', progress: 100, results: [{ url }], media: { width: 1280, height: 720 } }
   }
   mod.TokensApiClient.prototype.status = async function () {
+    statusCalls += 1
     return { status: 'succeeded', progress: 100, results: [{ url }], media: { width: 1280, height: 720 } }
   }
   globalThis.fetch = async function () {
@@ -938,6 +942,8 @@ test('completed videos stay remote and render inline without automatic downloads
     assert.equal('error' in recovered, false)
     assert.deepEqual(statusTool.output.render({}, recovered)[0], { type: 'video', url })
     assert.equal(downloadAttempts, 0)
+    assert.equal(pollCalls, 2)
+    assert.equal(statusCalls, 0)
   } finally {
     mod.TokensApiClient.prototype.submit = originalSubmit
     mod.TokensApiClient.prototype.poll = originalPoll

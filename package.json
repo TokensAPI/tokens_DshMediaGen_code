@@ -1,6 +1,6 @@
 {
   "name": "@tokensapi/dsh-media-gen",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "description": "Context-aware TokensAPI image and video generation tools for DeepSeek Harness",
   "license": "MIT",
   "repository": {
@@ -23,7 +23,7 @@
     "README.zh.md",
     "CHANGELOG.md",
     "LICENSE",
-    "docs/tokenscowork-0.7.5-compatibility.md"
+    "docs/tokenscowork-0.5.25-0.7.13-compatibility.md"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
@@ -38,7 +38,8 @@
     "test": "npm run build && node --test test/*.test.mjs",
     "check": "npm run typecheck && npm test && npm run build",
     "pack:dry": "npm run check && npm pack --dry-run --ignore-scripts",
-    "prepack": "npm run check"
+    "prepack": "npm run check",
+    "test:browser": "node test/media-browser.mjs"
   },
   "publishConfig": {
     "registry": "https://npm.tokensapi.ai/"

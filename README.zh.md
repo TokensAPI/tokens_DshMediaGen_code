@@ -6,9 +6,9 @@
 
 ## 兼容性
 
-版本 `0.3.10` 声明兼容受支持 TokensCowork 版本使用的 DSH 运行时：
+版本 `0.3.12` 声明兼容受支持 TokensCowork 版本使用的 DSH 运行时：
 
-- DeepSeek Harness / DSH `0.1.0-rc.8`、`0.1.3-alpha.1` `^0.1.5-rc.2` 和 `0.2.1-rc.2`（TokensCowork 0.7.5）
+- DeepSeek Harness / DSH `0.1.0-rc.8`、`0.1.3-alpha.1`、`^0.1.5-rc.2`（TokensCowork 0.5.25）和 `0.2.1-rc.2`（TokensCowork 0.7.13）
 - Cordis `>=4.0.1 <5`
 - Node.js `^22.19.0 || >=24.0.0`
 
@@ -24,6 +24,7 @@
 - 视频外链内联播放并保存本地 MP4；
 - 任务超时后查询并恢复结果；
 - 引导式媒体参数向导；
+- 向导、确认摘要和图片/视频结果卡片内置中英文，并自动跟随 TokensCowork 当前语言；
 - 可选提示词增强。
 
 ## 视频模型
@@ -51,7 +52,7 @@ TokensAPI 生产任务接口要求参考图片是公开可访问的 HTTPS URL。
 从 TokensAPI 私有 Registry 安装：
 
 ```bash
-npm install @tokensapi/dsh-media-gen@0.3.11 --registry=https://npm.tokensapi.ai/
+npm install @tokensapi/dsh-media-gen@0.3.12 --registry=https://npm.tokensapi.ai/
 ```
 
 ### 打包方：生成可分发安装包
@@ -161,6 +162,8 @@ TOKENSAPI_API_KEY
 ```
 
 提示词增强默认开启，并默认复用现有的 `TOKENSAPI_API_KEY`，通过 `https://tokensapi.ai/v1` 的 `deepseek-v4-flash` 模型增强图片和视频 Prompt，不需要额外配置 `DEEPSEEK_API_KEY`。如需使用其他兼容 OpenAI Chat Completions 的增强服务，可覆盖 `enhanceApiKeyEnv`、`enhanceBaseURL` 和 `enhanceModel`。
+
+插件只发布一个双语安装包，不拆分中文包和英文包。TokensCowork 切换语言后，插件的向导、确认摘要、按钮以及图片/视频结果卡片会跟随切换。翻译只作用于显示层，回传给 Host 的选项值保持稳定，因此不会因为切换语言而改变模型选择、确认结果或生成参数。
 
 从 `0.3.5` 开始，本地图片和对话附件上传默认复用同一个 `TOKENSAPI_API_KEY`，不需要额外配置账户访问令牌或用户 ID：
 
@@ -279,7 +282,7 @@ pnpm run pack:dry
 
 ## 已知限制
 
-- 版本 `0.3.10` 支持上方声明的 DSH 运行时版本线；其他预发布版本线需要单独验证；
+- 版本 `0.3.12` 支持上方声明的 DSH 运行时版本线；其他预发布版本线需要单独验证；
 - 视频历史播放器要求本地 MP4 仍保留在配置的 `outputDir`；文件缺失时回退 TokensAPI 外部 URL；
 - 当前公开生产任务接口不直接接受 Data URL；本地图片需要 TokensAPI 第一方上传端点；
 - 提交恢复状态目前只保存在插件进程内，不写入本地任务日志。重启 DSH/TokensCowork 后，尚未取得 `task_id` 的不确定提交无法自动恢复；已经保留在对话中的任务 ID 仍可手动查询；

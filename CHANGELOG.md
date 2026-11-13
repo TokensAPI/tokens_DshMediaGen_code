@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.12
+
+- Preserve the published 0.3.11 signed `Host` validation and all existing model, confirmation, and request contracts.
+- Recover reference-image uploads after an explicit `ECONNRESET` by retrying the same signed request once over TLS 1.2; cover presigned and direct R2 uploads used by image editing and first/last-frame video generation.
+- Retry transient generated-image downloads without creating another generation task, with a TLS 1.2 fallback for connection resets.
+- Keep `media_task_status` polling the existing image or video task through transient delays and return recoverable timeout state instead of submitting replacement work.
+- Promote successful generated/edited images and completed videos from the Called tools group into the chat, while keeping the tool card as a compatible fallback on older TokensCowork clients.
+- Add built-in Chinese and English client dictionaries that follow the active TokensCowork language without changing Host wire values.
+- Add verified compatibility coverage for TokensCowork 0.5.25 / DSH 0.1.5-rc.2 and TokensCowork 0.7.13 / DSH 0.2.1-rc.2 / Cordis 4.0.5.
+
 ## 0.3.11
 
 - Fix image uploads when TokensAPI includes Host in required_headers: validate it against the upload URL authority and let the HTTP client generate the header.

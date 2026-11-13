@@ -192,13 +192,176 @@ function sanitizeTaskId(taskId) {
 }
 
 // src/host/results.ts
-async function download(url, signal) {
-  const response = await fetch(url, { signal });
-  if (!response.ok) throw new Error(`Download failed (${response.status}) for ${url}`);
-  return {
-    bytes: Buffer.from(await response.arrayBuffer()),
-    mediaType: response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase()
-  };
+import { get as httpsGet } from "node:https";
+var DownloadHttpError = class extends Error {
+  constructor(message, status, retryAfterMs2) {
+    super(message);
+    this.status = status;
+    this.retryAfterMs = retryAfterMs2;
+    this.name = "DownloadHttpError";
+  }
+};
+var RETRYABLE_DOWNLOAD_STATUSES = /* @__PURE__ */ new Set([404, 408, 409, 425, 429, 500, 502, 503, 504]);
+function retryAfterMs(response) {
+  return retryAfterValueMs(response.headers.get("retry-after") ?? void 0);
+}
+function retryAfterValueMs(input) {
+  const value = input?.trim();
+  if (!value) return void 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1e3;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : void 0;
+}
+function retryableDownloadError(error) {
+  if (error instanceof DownloadHttpError) return RETRYABLE_DOWNLOAD_STATUSES.has(error.status);
+  return error instanceof TypeError || error instanceof Error && /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND/i.test(error.message);
+}
+function tlsConnectionReset(error) {
+  let current = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth += 1) {
+    const value = current;
+    if (value.code === "ECONNRESET" || typeof value.message === "string" && /ECONNRESET/i.test(value.message)) return true;
+    current = value.cause;
+  }
+  return false;
+}
+function headerValue(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+async function tls12Request(url, signal) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request;
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const succeed = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onAbort = () => request?.destroy(new Error("Generated image download cancelled"));
+    request = httpsGet(url, {
+      minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.2",
+      headers: {
+        Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+        "User-Agent": "TokensCowork-media-gen"
+      }
+    }, (response) => {
+      const status = response.statusCode ?? 0;
+      const location = headerValue(response.headers.location);
+      if (status >= 300 && status < 400 && location) {
+        response.resume();
+        try {
+          succeed({ redirect: new URL(location, url).toString() });
+        } catch (error) {
+          fail(error);
+        }
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        response.resume();
+        fail(new DownloadHttpError(
+          `Download failed (${status}) for ${url.toString()}`,
+          status,
+          retryAfterValueMs(headerValue(response.headers["retry-after"]))
+        ));
+        return;
+      }
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on("end", () => succeed({
+        bytes: Buffer.concat(chunks),
+        mediaType: headerValue(response.headers["content-type"])?.split(";", 1)[0]?.trim().toLowerCase()
+      }));
+      response.on("aborted", () => fail(new Error(`Generated image download was interrupted for ${url.toString()}`)));
+      response.on("error", fail);
+    });
+    request.on("error", (error) => {
+      if (signal?.aborted) fail(new Error("Generated image download cancelled"));
+      else fail(error);
+    });
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+async function downloadWithTls12(url, signal) {
+  let current = new URL(url);
+  for (let redirect = 0; redirect <= 5; redirect += 1) {
+    if (current.protocol !== "https:") throw new Error(`Generated media redirect must use HTTPS: ${current.toString()}`);
+    const result = await tls12Request(current, signal);
+    if (!("redirect" in result)) return result;
+    current = new URL(result.redirect);
+  }
+  throw new Error(`Too many redirects while downloading generated media from ${url}`);
+}
+async function waitForRetry(ms, signal) {
+  if (signal?.aborted) throw new Error("Generated image download cancelled");
+  if (ms <= 0) return;
+  await new Promise((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(new Error("Generated image download cancelled"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+async function download(url, signal, options = {}) {
+  const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? 4));
+  const baseDelayMs = Math.max(0, options.baseDelayMs ?? 750);
+  const tls12Downloader = options.tls12Downloader ?? downloadWithTls12;
+  let forceTls12 = false;
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (signal?.aborted) throw new Error("Generated image download cancelled");
+    try {
+      if (forceTls12) return await tls12Downloader(url, signal);
+      const response = await fetch(url, { signal });
+      if (!response.ok) {
+        throw new DownloadHttpError(
+          `Download failed (${response.status}) for ${url}`,
+          response.status,
+          retryAfterMs(response)
+        );
+      }
+      return {
+        bytes: Buffer.from(await response.arrayBuffer()),
+        mediaType: response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase()
+      };
+    } catch (error) {
+      if (signal?.aborted) throw new Error("Generated image download cancelled");
+      let retryError = error;
+      if (!forceTls12 && tlsConnectionReset(error) && new URL(url).protocol === "https:") {
+        forceTls12 = true;
+        try {
+          return await tls12Downloader(url, signal);
+        } catch (fallbackError) {
+          if (signal?.aborted) throw new Error("Generated image download cancelled");
+          retryError = fallbackError;
+        }
+      }
+      lastError = retryError;
+      if (!retryableDownloadError(retryError) || attempt + 1 >= maxAttempts) throw retryError;
+      const serverDelay = retryError instanceof DownloadHttpError ? retryError.retryAfterMs : void 0;
+      const delay = serverDelay ?? Math.min(baseDelayMs * 2 ** attempt, 4e3);
+      await waitForRetry(delay, signal);
+    }
+  }
+  throw lastError;
 }
 async function saveImages(urls, taskId, attachments, signal) {
   return Promise.all(urls.map(async (url, index) => {
@@ -274,10 +437,10 @@ function uploadHeaders(value, protocol) {
   const record = objectValue(value);
   if (!record) throw new Error("TokensAPI image upload response has invalid required_headers.");
   const entries = Object.entries(record);
-  if (entries.some(([name2, headerValue]) => !name2.trim() || typeof headerValue !== "string")) {
+  if (entries.some(([name2, headerValue2]) => !name2.trim() || typeof headerValue2 !== "string")) {
     throw new Error("TokensAPI image upload response has invalid required_headers.");
   }
-  return Object.fromEntries(entries.map(([name2, headerValue]) => [name2, String(headerValue)]));
+  return Object.fromEntries(entries.map(([name2, headerValue2]) => [name2, String(headerValue2)]));
 }
 function uploadExpiry(value) {
   if (value === void 0) return void 0;
@@ -324,6 +487,7 @@ function validateLocalImage(mimeType, byteLength) {
   return normalizedMimeType;
 }
 function validatedHeaders(headers, uploadUrl) {
+  const uploadHost = new URL(uploadUrl).host.toLowerCase();
   const result = {};
   const byLowerName = /* @__PURE__ */ new Map();
   for (const [rawName, rawValue] of Object.entries(headers)) {
@@ -335,16 +499,17 @@ function validatedHeaders(headers, uploadUrl) {
     if (byLowerName.has(lowerName)) {
       throw new Error(`TokensAPI image upload response contains duplicate required header ${name2}.`);
     }
+    if (lowerName === "host") {
+      if (rawValue.trim().toLowerCase() !== uploadHost) {
+        throw new Error(`TokensAPI image upload response Host header does not match upload_url host ${uploadHost}.`);
+      }
+      byLowerName.set(lowerName, rawValue);
+      continue;
+    }
     if (FORBIDDEN_UPLOAD_HEADERS.has(lowerName)) {
       throw new Error(`TokensAPI image upload response must not require sensitive header ${name2}.`);
     }
     byLowerName.set(lowerName, rawValue);
-    if (lowerName === "host") {
-      if (rawValue.trim().toLowerCase() !== new URL(uploadUrl).host.toLowerCase()) {
-        throw new Error("TokensAPI image upload response Host must match upload_url host and port.");
-      }
-      continue;
-    }
     result[name2] = rawValue;
   }
   return { headers: result, byLowerName };
@@ -403,12 +568,118 @@ function validateImageUploadGrant(grant, options) {
   };
 }
 
+// src/host/object-upload.ts
+import { request as httpsRequest } from "node:https";
+function abortError(signal) {
+  return signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted.", "AbortError");
+}
+function isConnectionReset(error) {
+  const pending = [error];
+  const visited = /* @__PURE__ */ new Set();
+  while (pending.length > 0 && visited.size < 16) {
+    const current = pending.shift();
+    if (!current || visited.has(current)) continue;
+    visited.add(current);
+    if (typeof current === "string") {
+      if (/\bECONNRESET\b/i.test(current)) return true;
+      continue;
+    }
+    if (typeof current !== "object") continue;
+    const value = current;
+    if (typeof value.code === "string" && value.code.toUpperCase() === "ECONNRESET") return true;
+    if (typeof value.message === "string" && /\bECONNRESET\b/i.test(value.message)) return true;
+    if (value.cause !== void 0) pending.push(value.cause);
+    if (Array.isArray(value.errors)) pending.push(...value.errors);
+  }
+  return false;
+}
+function nativeHeaders(headers, byteLength) {
+  const result = {};
+  let hasContentLength = false;
+  for (const [name2, value] of Object.entries(headers)) {
+    const lowerName = name2.toLowerCase();
+    if (lowerName === "host") continue;
+    if (lowerName === "content-length") hasContentLength = true;
+    result[name2] = value;
+  }
+  if (!hasContentLength) result["Content-Length"] = String(byteLength);
+  return result;
+}
+function responseHeaders(headers) {
+  const result = new Headers();
+  for (const [name2, value] of Object.entries(headers)) {
+    if (Array.isArray(value)) {
+      for (const item of value) result.append(name2, item);
+    } else if (value !== void 0) {
+      result.set(name2, value);
+    }
+  }
+  return result;
+}
+async function uploadObjectWithTls12(request) {
+  if (request.signal?.aborted) throw abortError(request.signal);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback) => {
+      if (settled) return;
+      settled = true;
+      request.signal?.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const fail = (error) => finish(() => reject(error));
+    const clientRequest = httpsRequest(request.url, {
+      method: request.method,
+      headers: nativeHeaders(request.headers, request.body.byteLength),
+      minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.2"
+    }, (incoming) => {
+      const chunks = [];
+      incoming.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      incoming.once("error", fail);
+      incoming.once("end", () => finish(() => {
+        const bytes = Buffer.concat(chunks);
+        resolve(new Response(bytes.length > 0 ? bytes : null, {
+          status: incoming.statusCode ?? 500,
+          statusText: incoming.statusMessage,
+          headers: responseHeaders(incoming.headers)
+        }));
+      }));
+    });
+    function onAbort() {
+      clientRequest.destroy(abortError(request.signal));
+    }
+    clientRequest.once("error", fail);
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    if (request.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    clientRequest.end(request.body);
+  });
+}
+async function uploadObjectWithTlsRecovery(request, dependencies = {}) {
+  if (request.signal?.aborted) throw abortError(request.signal);
+  const fetcher = dependencies.fetcher ?? fetch;
+  try {
+    return await fetcher(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+      redirect: "error",
+      signal: request.signal
+    });
+  } catch (error) {
+    if (request.signal?.aborted || !isConnectionReset(error)) throw error;
+    return (dependencies.tls12Uploader ?? uploadObjectWithTls12)(request);
+  }
+}
+
 // src/host/tokensapi.ts
 var TokensApiHttpError = class extends Error {
-  constructor(message, status, retryAfterMs) {
+  constructor(message, status, retryAfterMs2) {
     super(message);
     this.status = status;
-    this.retryAfterMs = retryAfterMs;
+    this.retryAfterMs = retryAfterMs2;
     this.name = "TokensApiHttpError";
   }
 };
@@ -541,8 +812,8 @@ ${canonicalJson(body)}`);
       if (record.taskId === taskId) this.pendingSubmissions.delete(fingerprint);
     }
   }
-  retryDelay(attempt, retryAfterMs) {
-    if (retryAfterMs !== void 0) return Math.min(retryAfterMs, 3e4);
+  retryDelay(attempt, retryAfterMs2) {
+    if (retryAfterMs2 !== void 0) return Math.min(retryAfterMs2, 3e4);
     const factors = [1, 1.6, 2.6, 4, 6];
     const factor = factors[Math.min(attempt, factors.length - 1)] ?? 6;
     return Math.min(3e4, Math.max(1, Math.round(this.config.pollIntervalMs * factor)));
@@ -599,11 +870,11 @@ ${canonicalJson(body)}`);
       mimeType: mediaType,
       byteLength: bytes.length
     });
-    const uploadResponse = await fetch(grant.uploadUrl, {
+    const uploadResponse = await uploadObjectWithTlsRecovery({
+      url: grant.uploadUrl,
       method: grant.uploadMethod,
       headers: grant.requiredHeaders,
       body: bytes,
-      redirect: "error",
       signal
     });
     if (!uploadResponse.ok) throw new Error(`TokensAPI object upload failed (${uploadResponse.status}): ${uploadResponse.statusText}`);
@@ -641,7 +912,8 @@ ${canonicalJson(body)}`);
       secretAccessKey,
       region: this.config.r2Region.trim() || "auto"
     });
-    const uploadResponse = await fetch(`https://${endpoint.host}${path}`, {
+    const uploadResponse = await uploadObjectWithTlsRecovery({
+      url: `https://${endpoint.host}${path}`,
       method: "PUT",
       headers: {
         "Content-Type": mediaType,
@@ -753,8 +1025,8 @@ ${canonicalJson(body)}`);
         if (signal?.aborted) throw new Error("Generation cancelled");
         if (!this.isTransientError(error)) throw new Error(`Generation task ${taskId} status check failed: ${error instanceof Error ? error.message : String(error)}`);
         if (Date.now() > deadline) return { ...lastData, task_id: taskId, timedOut: true, recoverable: true };
-        const retryAfterMs = error instanceof TokensApiHttpError ? error.retryAfterMs : void 0;
-        await this.wait(this.retryDelay(transientAttempts, retryAfterMs), signal);
+        const retryAfterMs2 = error instanceof TokensApiHttpError ? error.retryAfterMs : void 0;
+        await this.wait(this.retryDelay(transientAttempts, retryAfterMs2), signal);
         transientAttempts += 1;
         continue;
       }
@@ -1493,7 +1765,7 @@ Reuse contract: previousTask contains only the most recent completed same-intent
 
 The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. If the wizard result has cancelled=true, stop the media flow for this user request: do not reopen the wizard and do not call any media_generate_* tool until the user sends a new request. The plugin tracks successful confirmation internally for the current user request; do not invent or pass a confirmation id. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
 
-Submission safety contract: a network error, HTTP 429, unchanged progress, or a timed-out foreground wait does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, or says the submission status is uncertain, do not call a media_generate_* tool again for that request. Continue with media_task_status when a taskId is known. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`
+Submission safety contract: a network error, HTTP 429, unchanged progress, a timed-out foreground wait, or a result attachment warning does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, says the submission status is uncertain, or reports an attachment warning, do not call a media_generate_* tool again for that request. Continue with media_task_status using the same taskId and media kind. The recovery tool keeps polling the existing image or video task and retries generated-image attachment downloads; it never creates a replacement generation task. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`
   });
   register({
     name: "media_wizard",
@@ -1861,7 +2133,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       const data = await api.poll(taskId, exec.signal);
       const timedOut = data.timedOut === true;
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal);
-      if (!timedOut && images.length > 0) exec.concludeTurn();
+      if (!timedOut && images.length > 0 && images.every((image) => !image.error)) exec.concludeTurn();
       return { taskId, model, images, ...timedOut ? pendingTaskFields(data) : {} };
     }
   });
@@ -1901,7 +2173,7 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       const data = await api.poll(taskId, exec.signal);
       const timedOut = data.timedOut === true;
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal);
-      if (!timedOut && images.length > 0) exec.concludeTurn();
+      if (!timedOut && images.length > 0 && images.every((image2) => !image2.error)) exec.concludeTurn();
       return { taskId, model, images, ...timedOut ? pendingTaskFields(data) : {} };
     }
   });
@@ -2065,6 +2337,8 @@ Video models: ${value.videos.join(", ")}` }]
           images: { type: "array", items: imageOutputSchema().properties.images.items },
           url: { type: "string" },
           filePath: { type: "string" },
+          timedOut: { type: "boolean" },
+          recoverable: { type: "boolean" },
           error: { type: "string" }
         }
       },
@@ -2082,9 +2356,12 @@ Video models: ${value.videos.join(", ")}` }]
       }
     },
     async execute(args, exec) {
-      const data = await api.status(args.task_id, exec.signal);
+      const data = await api.poll(args.task_id, exec.signal);
       const status = typeof data.status === "string" ? data.status : "unknown";
       const progress = typeof data.progress === "number" ? data.progress : 0;
+      if (data.timedOut === true) {
+        return { taskId: args.task_id, status, progress, kind: args.kind, ...pendingTaskFields(data) };
+      }
       if (status !== "succeeded") return { taskId: args.task_id, status, progress };
       const urls = api.urls(data);
       const detectedKind = args.kind && args.kind !== "auto" ? args.kind : data.media && typeof data.media === "object" ? "videos" : urls.some((url) => /\.(?:mp4|webm)(?:\?|$)/i.test(url)) ? "videos" : "images";
@@ -2093,7 +2370,7 @@ Video models: ${value.videos.join(", ")}` }]
         return { taskId: args.task_id, status, progress, kind: "videos", ...urls[0] ? { url: urls[0] } : {} };
       }
       const images = await saveImages(urls, args.task_id, attachments, exec.signal);
-      if (images.length > 0) exec.concludeTurn();
+      if (images.length > 0 && images.every((image) => !image.error)) exec.concludeTurn();
       return { taskId: args.task_id, status, progress, kind: "images", images };
     }
   });
@@ -2105,10 +2382,15 @@ export {
   VIDEO_MODEL_CAPABILITIES,
   VIDEO_MODEL_IDS,
   apply,
+  download as downloadGeneratedImage,
+  downloadWithTls12,
   inject,
   isVideoModel,
   name,
   parseImageUploadGrant,
+  saveImages,
+  uploadObjectWithTls12,
+  uploadObjectWithTlsRecovery,
   validateImageUploadGrant,
   videoModelCapability
 };

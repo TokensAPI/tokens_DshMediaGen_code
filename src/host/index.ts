@@ -21,8 +21,11 @@ import {
 import { saveImages } from './results.js'
 import { TokensApiClient } from './tokensapi.js'
 export { TokensApiClient } from './tokensapi.js'
+export { download as downloadGeneratedImage, downloadWithTls12, saveImages } from './results.js'
 export { parseImageUploadGrant, validateImageUploadGrant } from './image-upload.js'
 export type { ImageUploadGrant, ImageUploadProtocol, ImageUploadValidationOptions } from './image-upload.js'
+export { uploadObjectWithTls12, uploadObjectWithTlsRecovery } from './object-upload.js'
+export type { ObjectUploadDependencies, ObjectUploadRequest } from './object-upload.js'
 export {
   VIDEO_MODEL_CAPABILITIES,
   VIDEO_MODEL_IDS,
@@ -786,7 +789,7 @@ Reuse contract: previousTask contains only the most recent completed same-intent
 
 The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. If the wizard result has cancelled=true, stop the media flow for this user request: do not reopen the wizard and do not call any media_generate_* tool until the user sends a new request. The plugin tracks successful confirmation internally for the current user request; do not invent or pass a confirmation id. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
 
-Submission safety contract: a network error, HTTP 429, unchanged progress, or a timed-out foreground wait does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, or says the submission status is uncertain, do not call a media_generate_* tool again for that request. Continue with media_task_status when a taskId is known. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`,
+Submission safety contract: a network error, HTTP 429, unchanged progress, a timed-out foreground wait, or a result attachment warning does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, says the submission status is uncertain, or reports an attachment warning, do not call a media_generate_* tool again for that request. Continue with media_task_status using the same taskId and media kind. The recovery tool keeps polling the existing image or video task and retries generated-image attachment downloads; it never creates a replacement generation task. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`,
   })
 
   register({
@@ -1135,7 +1138,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       const data = await api.poll(taskId, exec.signal)
       const timedOut = data.timedOut === true
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal)
-      if (!timedOut && images.length > 0) exec.concludeTurn()
+      if (!timedOut && images.length > 0 && images.every((image) => !image.error)) exec.concludeTurn()
       return { taskId, model, images, ...(timedOut ? pendingTaskFields(data) : {}) }
     },
   })
@@ -1176,7 +1179,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       const data = await api.poll(taskId, exec.signal)
       const timedOut = data.timedOut === true
       const images = timedOut ? [] : await saveImages(api.urls(data), taskId, attachments, exec.signal)
-      if (!timedOut && images.length > 0) exec.concludeTurn()
+      if (!timedOut && images.length > 0 && images.every((image) => !image.error)) exec.concludeTurn()
       return { taskId, model, images, ...(timedOut ? pendingTaskFields(data) : {}) }
     },
   })
@@ -1341,6 +1344,8 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
           images: { type: 'array', items: imageOutputSchema().properties.images.items },
           url: { type: 'string' },
           filePath: { type: 'string' },
+          timedOut: { type: 'boolean' },
+          recoverable: { type: 'boolean' },
           error: { type: 'string' },
         },
       },
@@ -1358,9 +1363,12 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
       },
     },
     async execute(args: AnyRecord, exec: AnyRecord) {
-      const data = await api.status(args.task_id, exec.signal)
+      const data = await api.poll(args.task_id, exec.signal)
       const status = typeof data.status === 'string' ? data.status : 'unknown'
       const progress = typeof data.progress === 'number' ? data.progress : 0
+      if (data.timedOut === true) {
+        return { taskId: args.task_id, status, progress, kind: args.kind, ...pendingTaskFields(data) }
+      }
       if (status !== 'succeeded') return { taskId: args.task_id, status, progress }
       const urls = api.urls(data)
       const detectedKind = args.kind && args.kind !== 'auto'
@@ -1371,7 +1379,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, or a 
         return { taskId: args.task_id, status, progress, kind: 'videos', ...(urls[0] ? { url: urls[0] } : {}) }
       }
       const images = await saveImages(urls, args.task_id, attachments, exec.signal)
-      if (images.length > 0) exec.concludeTurn()
+      if (images.length > 0 && images.every((image) => !image.error)) exec.concludeTurn()
       return { taskId: args.task_id, status, progress, kind: 'images', images }
     },
   })

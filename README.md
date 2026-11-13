@@ -6,9 +6,9 @@ This package is maintained under the `@tokensapi` npm scope and is derived from 
 
 ## Compatibility
 
-Version `0.3.10` declares compatibility with the DSH runtime lines used by supported TokensCowork releases:
+Version `0.3.12` declares compatibility with the DSH runtime lines used by supported TokensCowork releases:
 
-- DeepSeek Harness / DSH `0.1.0-rc.8`, `0.1.3-alpha.1`, `^0.1.5-rc.2`, and `0.2.1-rc.2` (TokensCowork 0.7.5)
+- DeepSeek Harness / DSH `0.1.0-rc.8`, `0.1.3-alpha.1`, `^0.1.5-rc.2` (TokensCowork 0.5.25), and `0.2.1-rc.2` (TokensCowork 0.7.13)
 - Cordis `>=4.0.1 <5`
 - Node.js `^22.19.0 || >=24.0.0`
 
@@ -24,6 +24,7 @@ The obsolete `@deepseek-ai/dsh-client-runtime` peer is not required by the clien
 - Inline remote video playback plus local MP4 saving;
 - Timed-out task status and result recovery;
 - Context-aware missing-parameter media wizard;
+- Chinese and English wizard and result-card UI that automatically follows the active TokensCowork language;
 - Direct current-conversation DSH attachment input with ordered multi-image selectors;
 - TokensAPI presigned or configurable R2/S3 reference-image upload;
 - Prompt enhancement enabled by default through TokensAPI (`deepseek-v4-flash`).
@@ -51,7 +52,7 @@ Local images and current-conversation DSH attachments use first-party storage. S
 Install from the TokensAPI private registry for your TokensCowork organization:
 
 ```bash
-npm install @tokensapi/dsh-media-gen@0.3.11 --registry=https://npm.tokensapi.ai/
+npm install @tokensapi/dsh-media-gen@0.3.12 --registry=https://npm.tokensapi.ai/
 ```
 
 Register the package in the active DSH profile:
@@ -69,6 +70,8 @@ TOKENSAPI_API_KEY
 ```
 
 Prompt enhancement and first-party local-image upload both reuse `TOKENSAPI_API_KEY`; no separate DeepSeek or account access token is required by the default configuration. Legacy custom `/api/aigc/presign` deployments can still explicitly select `uploadAuthMode: account` and configure their account credential and user ID.
+
+The plugin ships one bilingual client bundle rather than separate language packages. Its wizard, summaries, buttons, image cards, and video cards follow the language selected in TokensCowork. Localized labels are display-only: answers sent back to the Host retain their stable original values, so switching languages does not change model selection, confirmation, or generation parameters.
 
 The `0.3.5` image-upload defaults are:
 
@@ -105,7 +108,7 @@ pnpm run pack:dry
 
 ## Limitations
 
-- Version `0.3.10` supports the declared DSH runtime lines above; other prerelease lines require separate validation.
+- Version `0.3.12` supports the declared DSH runtime lines above; other prerelease lines require separate validation.
 - DSH `rc.8` has no video attachment type. The plugin therefore serves saved MP4 files through a restricted same-origin `/media-gen/videos/` route with byte-range support; remote TokensAPI URLs remain the fallback.
 - Public generation task endpoints do not directly accept Data URLs. Local images are converted and sent through TokensAPI presigned object storage before task submission.
 - Submission recovery state is currently process-local and is not written to a task journal. Restarting DSH/TokensCowork clears uncertain submissions that never returned a `task_id`; known task IDs remain recoverable when retained in conversation history.

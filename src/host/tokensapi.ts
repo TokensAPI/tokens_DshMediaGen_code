@@ -3,6 +3,7 @@ import { createHash, createHmac } from 'node:crypto'
 import type { MediaConfig } from './types.js'
 import { extensionForMediaType, resultUrls } from '../shared/media.js'
 import { parseImageUploadGrant, validateImageUploadGrant } from './image-upload.js'
+import { uploadObjectWithTlsRecovery } from './object-upload.js'
 
 type MediaTaskKind = 'images' | 'videos'
 
@@ -244,11 +245,11 @@ export class TokensApiClient {
       mimeType: mediaType,
       byteLength: bytes.length,
     })
-    const uploadResponse = await fetch(grant.uploadUrl, {
+    const uploadResponse = await uploadObjectWithTlsRecovery({
+      url: grant.uploadUrl,
       method: grant.uploadMethod,
       headers: grant.requiredHeaders,
       body: bytes,
-      redirect: 'error',
       signal,
     })
     if (!uploadResponse.ok) throw new Error(`TokensAPI object upload failed (${uploadResponse.status}): ${uploadResponse.statusText}`)
@@ -287,7 +288,8 @@ export class TokensApiClient {
       secretAccessKey,
       region: this.config.r2Region.trim() || 'auto',
     })
-    const uploadResponse = await fetch(`https://${endpoint.host}${path}`, {
+    const uploadResponse = await uploadObjectWithTlsRecovery({
+      url: `https://${endpoint.host}${path}`,
       method: 'PUT',
       headers: {
         'Content-Type': mediaType,

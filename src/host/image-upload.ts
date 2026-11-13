@@ -135,6 +135,7 @@ function validatedHeaders(headers: Record<string, string>, uploadUrl: string): {
   headers: Record<string, string>
   byLowerName: Map<string, string>
 } {
+  const uploadHost = new URL(uploadUrl).host.toLowerCase()
   const result: Record<string, string> = {}
   const byLowerName = new Map<string, string>()
   for (const [rawName, rawValue] of Object.entries(headers)) {
@@ -146,19 +147,19 @@ function validatedHeaders(headers: Record<string, string>, uploadUrl: string): {
     if (byLowerName.has(lowerName)) {
       throw new Error(`TokensAPI image upload response contains duplicate required header ${name}.`)
     }
+    if (lowerName === 'host') {
+      if (rawValue.trim().toLowerCase() !== uploadHost) {
+        throw new Error(`TokensAPI image upload response Host header does not match upload_url host ${uploadHost}.`)
+      }
+      // Host participates in S3 signatures, but fetch derives it from upload_url.
+      // Never forward a server-supplied Host override explicitly.
+      byLowerName.set(lowerName, rawValue)
+      continue
+    }
     if (FORBIDDEN_UPLOAD_HEADERS.has(lowerName)) {
       throw new Error(`TokensAPI image upload response must not require sensitive header ${name}.`)
     }
     byLowerName.set(lowerName, rawValue)
-    // The HTTP client supplies Host from the URL (also part of S3 signatures).
-    // Accept the service's declaration only when it matches that authority;
-    // never forward a caller-controlled Host override.
-    if (lowerName === 'host') {
-      if (rawValue.trim().toLowerCase() !== new URL(uploadUrl).host.toLowerCase()) {
-        throw new Error('TokensAPI image upload response Host must match upload_url host and port.')
-      }
-      continue
-    }
     result[name] = rawValue
   }
   return { headers: result, byLowerName }
