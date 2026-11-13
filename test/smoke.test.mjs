@@ -21,7 +21,7 @@ test('client bundle registers the published package name', async () => {
 
 test('package metadata covers supported TokensCowork runtimes without the obsolete client runtime peer', async () => {
   const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
-  const supportedRange = '0.1.0-rc.8 || 0.1.3-alpha.1 || ^0.1.5-rc.2'
+  const supportedRange = '0.1.0-rc.8 || 0.1.3-alpha.1 || ^0.1.5-rc.2 || 0.2.1-rc.2'
   const runtimePeers = [
     '@deepseek-ai/dsh-credentials',
     '@deepseek-ai/dsh-tools',
@@ -30,7 +30,8 @@ test('package metadata covers supported TokensCowork runtimes without the obsole
     '@deepseek-ai/dsh-client-ui-tool',
   ]
 
-  assert.equal(pkg.version, '0.3.9')
+  assert.equal(pkg.version, '0.3.11')
+  assert.equal(pkg.engines.dsh, supportedRange)
   assert.equal(pkg.dsh.engine, supportedRange)
   assert.equal(pkg.peerDependencies['@deepseek-ai/cordis'], '>=4.0.1 <5')
   for (const name of runtimePeers) assert.equal(pkg.peerDependencies[name], supportedRange)

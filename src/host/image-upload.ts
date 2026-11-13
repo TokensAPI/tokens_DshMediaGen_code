@@ -27,7 +27,6 @@ const MAX_IMAGE_BYTES = 30 * 1024 * 1024
 const FORBIDDEN_UPLOAD_HEADERS = new Set([
   'authorization',
   'cookie',
-  'host',
   'proxy-authorization',
 ])
 
@@ -132,7 +131,7 @@ function validateLocalImage(mimeType: string, byteLength: number): string {
   return normalizedMimeType
 }
 
-function validatedHeaders(headers: Record<string, string>): {
+function validatedHeaders(headers: Record<string, string>, uploadUrl: string): {
   headers: Record<string, string>
   byLowerName: Map<string, string>
 } {
@@ -151,6 +150,15 @@ function validatedHeaders(headers: Record<string, string>): {
       throw new Error(`TokensAPI image upload response must not require sensitive header ${name}.`)
     }
     byLowerName.set(lowerName, rawValue)
+    // The HTTP client supplies Host from the URL (also part of S3 signatures).
+    // Accept the service's declaration only when it matches that authority;
+    // never forward a caller-controlled Host override.
+    if (lowerName === 'host') {
+      if (rawValue.trim().toLowerCase() !== new URL(uploadUrl).host.toLowerCase()) {
+        throw new Error('TokensAPI image upload response Host must match upload_url host and port.')
+      }
+      continue
+    }
     result[name] = rawValue
   }
   return { headers: result, byLowerName }
@@ -200,7 +208,7 @@ export function validateImageUploadGrant(
   if (grant.uploadMethod !== 'PUT') {
     throw new Error(`TokensAPI image upload method must be PUT, received ${grant.uploadMethod || '(empty)'}.`)
   }
-  const checked = validatedHeaders(grant.requiredHeaders)
+  const checked = validatedHeaders(grant.requiredHeaders, grant.uploadUrl)
   const strict = grant.protocol === 'assets-v1'
   validateContentLength(checked.byLowerName.get('content-length'), options.byteLength, strict)
   validateContentType(checked.byLowerName.get('content-type'), mimeType, strict)

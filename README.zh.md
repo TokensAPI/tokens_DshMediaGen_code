@@ -6,9 +6,9 @@
 
 ## 兼容性
 
-版本 `0.3.9` 声明兼容受支持 TokensCowork 版本使用的 DSH 运行时：
+版本 `0.3.10` 声明兼容受支持 TokensCowork 版本使用的 DSH 运行时：
 
-- DeepSeek Harness / DSH `0.1.0-rc.8`、`0.1.3-alpha.1` 和 `^0.1.5-rc.2`
+- DeepSeek Harness / DSH `0.1.0-rc.8`、`0.1.3-alpha.1` `^0.1.5-rc.2` 和 `0.2.1-rc.2`（TokensCowork 0.7.5）
 - Cordis `>=4.0.1 <5`
 - Node.js `^22.19.0 || >=24.0.0`
 
@@ -51,7 +51,7 @@ TokensAPI 生产任务接口要求参考图片是公开可访问的 HTTPS URL。
 从 TokensAPI 私有 Registry 安装：
 
 ```bash
-npm install @tokensapi/dsh-media-gen@0.3.8 --registry=https://npm.tokensapi.ai/
+npm install @tokensapi/dsh-media-gen@0.3.11 --registry=https://npm.tokensapi.ai/
 ```
 
 ### 打包方：生成可分发安装包
@@ -279,7 +279,7 @@ pnpm run pack:dry
 
 ## 已知限制
 
-- 版本 `0.3.9` 支持上方声明的 DSH 运行时版本线；其他预发布版本线需要单独验证；
+- 版本 `0.3.10` 支持上方声明的 DSH 运行时版本线；其他预发布版本线需要单独验证；
 - 视频历史播放器要求本地 MP4 仍保留在配置的 `outputDir`；文件缺失时回退 TokensAPI 外部 URL；
 - 当前公开生产任务接口不直接接受 Data URL；本地图片需要 TokensAPI 第一方上传端点；
 - 提交恢复状态目前只保存在插件进程内，不写入本地任务日志。重启 DSH/TokensCowork 后，尚未取得 `task_id` 的不确定提交无法自动恢复；已经保留在对话中的任务 ID 仍可手动查询；

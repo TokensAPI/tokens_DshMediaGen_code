@@ -186,11 +186,38 @@ test('rejects sensitive, duplicated, and malformed required headers', async () =
     required_headers: { 'Content-Length': '4', 'Content-Type': 'image/png' },
   }
   const options = { mimeType: 'image/png', byteLength: 4 }
-  for (const name of ['Authorization', 'cookie', 'Proxy-Authorization', 'HOST']) {
+  for (const name of ['Authorization', 'cookie', 'Proxy-Authorization']) {
     assert.throws(() => validateImageUploadGrant(parseImageUploadGrant({ ...response, required_headers: { ...response.required_headers, [name]: 'secret' } }), options), /must not require sensitive header/)
   }
   assert.throws(() => validateImageUploadGrant(parseImageUploadGrant({ ...response, required_headers: { ...response.required_headers, 'content-type': 'image/png' } }), options), /duplicate required header/)
   assert.throws(() => validateImageUploadGrant(parseImageUploadGrant({ ...response, required_headers: { ...response.required_headers, 'x-amz-meta-test': 'ok\r\ninjected: true' } }), options), /invalid required header/)
+})
+
+test('accepts matching Host declarations without forwarding an explicit Host header', async () => {
+  const { validateImageUploadGrant } = await import('../dist/index.js')
+  for (const [uploadUrl, host] of [
+    ['https://s3.example.com/object', 's3.example.com'],
+    ['https://S3.example.com/object', ' S3.EXAMPLE.COM '],
+    ['https://s3.example.com:9443/object', 's3.example.com:9443'],
+    ['https://[::1]:9443/object', '[::1]:9443'],
+  ]) {
+    const grant = { uploadUrl, accessUrl: 'https://cdn.example.com/object.png', uploadMethod: 'PUT', protocol: 'assets-v1',
+      requiredHeaders: { hOsT: host, 'Content-Length': '4', 'Content-Type': 'image/png' } }
+    const checked = validateImageUploadGrant(grant, { mimeType: 'image/png', byteLength: 4 })
+    assert.deepEqual(checked.requiredHeaders, { 'Content-Length': '4', 'Content-Type': 'image/png' })
+    assert.equal(grant.requiredHeaders.hOsT, host)
+  }
+})
+
+test('rejects mismatched, duplicated, or injected Host declarations', async () => {
+  const { validateImageUploadGrant } = await import('../dist/index.js')
+  const grant = { uploadUrl: 'https://s3.example.com:9443/object', accessUrl: 'https://cdn.example.com/object.png', uploadMethod: 'PUT', protocol: 'assets-v1',
+    requiredHeaders: { 'Content-Length': '4', 'Content-Type': 'image/png' } }
+  for (const Host of ['other.example.com:9443', 's3.example.com', 's3.example.com:443', '', 's3.example.com:9443.evil.test']) {
+    assert.throws(() => validateImageUploadGrant({ ...grant, requiredHeaders: { ...grant.requiredHeaders, Host } }, { mimeType: 'image/png', byteLength: 4 }), /Host must match/)
+  }
+  assert.throws(() => validateImageUploadGrant({ ...grant, requiredHeaders: { ...grant.requiredHeaders, Host: 's3.example.com:9443', host: 's3.example.com:9443' } }, { mimeType: 'image/png', byteLength: 4 }), /duplicate required header/)
+  assert.throws(() => validateImageUploadGrant({ ...grant, requiredHeaders: { ...grant.requiredHeaders, Host: 's3.example.com:9443\r\nX-Test: bad' } }, { mimeType: 'image/png', byteLength: 4 }), /invalid required header/)
 })
 
 test('validates local MIME and size before accepting an upload grant', async () => {
@@ -233,6 +260,7 @@ test('Host requests an assets v1 grant and uploads raw bytes with only signed he
         access_url: 'https://cdn.example.com/api-assets/object.png',
         upload_method: 'PUT',
         required_headers: {
+          Host: 's3.example.com',
           'Content-Length': '4',
           'Content-Type': 'image/png',
           'x-amz-checksum-sha256': 'checksum',

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.11
+
+- Fix image uploads when TokensAPI includes Host in required_headers: validate it against the upload URL authority and let the HTTP client generate the header.
+- Continue rejecting mismatched hosts or ports, duplicate headers, header injection, and authentication headers.
+- Add upload regressions; preserve the published 0.3.10 runtime compatibility and scoped-session image rendering fixes.
+- Verified by 65 automated tests and user acceptance of the image-edit upload flow.
+
+## 0.3.10
+
+- Add verified compatibility with TokensCowork 0.7.5 / DSH 0.2.1-rc.2 / Cordis 4.0.5.
+- Read image attachments using the result card’s scoped Session identity.
+- Pin the development SDK and add scoped-image and real React/Cordis browser regressions.
+- Keep generation models, confirmation rules and request parameters unchanged.
+
 ## 0.3.9
 
 - Add explicit peer compatibility for the DSH runtime lines used by legacy TokensCowork, the intermediate alpha runtime, and TokensCowork 0.5.1.

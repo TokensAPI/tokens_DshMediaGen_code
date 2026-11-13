@@ -240,7 +240,6 @@ var MAX_IMAGE_BYTES = 30 * 1024 * 1024;
 var FORBIDDEN_UPLOAD_HEADERS = /* @__PURE__ */ new Set([
   "authorization",
   "cookie",
-  "host",
   "proxy-authorization"
 ]);
 function objectValue(value) {
@@ -324,7 +323,7 @@ function validateLocalImage(mimeType, byteLength) {
   }
   return normalizedMimeType;
 }
-function validatedHeaders(headers) {
+function validatedHeaders(headers, uploadUrl) {
   const result = {};
   const byLowerName = /* @__PURE__ */ new Map();
   for (const [rawName, rawValue] of Object.entries(headers)) {
@@ -340,6 +339,12 @@ function validatedHeaders(headers) {
       throw new Error(`TokensAPI image upload response must not require sensitive header ${name2}.`);
     }
     byLowerName.set(lowerName, rawValue);
+    if (lowerName === "host") {
+      if (rawValue.trim().toLowerCase() !== new URL(uploadUrl).host.toLowerCase()) {
+        throw new Error("TokensAPI image upload response Host must match upload_url host and port.");
+      }
+      continue;
+    }
     result[name2] = rawValue;
   }
   return { headers: result, byLowerName };
@@ -382,7 +387,7 @@ function validateImageUploadGrant(grant, options) {
   if (grant.uploadMethod !== "PUT") {
     throw new Error(`TokensAPI image upload method must be PUT, received ${grant.uploadMethod || "(empty)"}.`);
   }
-  const checked = validatedHeaders(grant.requiredHeaders);
+  const checked = validatedHeaders(grant.requiredHeaders, grant.uploadUrl);
   const strict = grant.protocol === "assets-v1";
   validateContentLength(checked.byLowerName.get("content-length"), options.byteLength, strict);
   validateContentType(checked.byLowerName.get("content-type"), mimeType, strict);
