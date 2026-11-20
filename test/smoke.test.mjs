@@ -30,7 +30,7 @@ test('package metadata covers supported TokensCowork runtimes without the obsole
     '@deepseek-ai/dsh-client-ui-tool',
   ]
 
-  assert.equal(pkg.version, '0.3.12')
+  assert.equal(pkg.version, '0.3.14')
   assert.ok(pkg.files.includes('docs/tokenscowork-0.5.25-0.7.13-compatibility.md'))
   assert.equal(pkg.dsh.engine, supportedRange)
   assert.equal(pkg.engines.dsh, supportedRange)
@@ -67,7 +67,8 @@ test('client bundle owns only namespaced media option questions and initializes 
   assert.match(client, /mediaQuestionMeta\(question\.id\)\?\.defaultIndex/)
   assert.match(client, /event\.key !== ' ' && event\.key !== 'Enter'/)
   assert.match(client, /'aria-pressed': selected/)
-  assert.match(client, /Promise\.resolve\(\)\.then\(\(\) => pending\.cancel\(\)\)/)
+  assert.match(client, /typeof pending\.cancel === 'function'/)
+  assert.match(client, /typeof pending\.dismiss === 'function'/)
   assert.match(client, /var defaultDraft = initialMediaQuestionDraft\(question\)/)
   assert.match(client, /\? \{ \.\.\.defaultDraft, skipped: false \}/)
   assert.match(client, /使用默认值并跳过当前选择/)

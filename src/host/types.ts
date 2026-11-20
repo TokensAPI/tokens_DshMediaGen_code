@@ -1,4 +1,4 @@
-import type { ImageModel, VideoModel } from '../shared/media.js'
+import type { ImageEditModel, ImageModel, VideoModel } from '../shared/media.js'
 
 export interface GeneratedImage {
   url: string
@@ -18,7 +18,7 @@ export interface MediaConfig {
   pollIntervalMs: number
   maxPollMs: number
   defaultImageModel: ImageModel
-  defaultEditModel: 'image2' | 'qwen_image'
+  defaultEditModel: ImageEditModel
   defaultVideoModel: VideoModel
   enhanceEnabled: boolean
   enhanceApiKeyEnv: string

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.14
+
+- Remove legacy Image 2 (`image2`) from image-generation/editing choices, discovery, and tool schemas while preserving Image 2.6 Sunburst / Flare. Normalize stored legacy defaults to H3 Image / Qwen Image in memory and discard incompatible historical settings before re-selection.
+- Recover omitted optional generation arguments only from the current Session/user-request/intent's unexpired wizard confirmation, preserving the selected H3 Image 1k / 2k resolution and explicit model/reference/frame choices on the first call. Keep required-field validation, reject explicit parameter changes, and prohibit recovery after cancellation or across requests.
+- Fix the composer being bypassed on desktop cards exposing `dismiss()` instead of `cancel()`. Support both carriers, keep read-only review cards on the native renderer, and make X cancel the wizard even when native dismissal would only hide its panel.
+- Emit canonical model labels from the Host as well as the Client, translating answers back to unchanged API IDs. Regress actual Host questions against the desktop's PendingQuestion and competing native composer through SlotCore.
+- Always show the initial prompt card, with a default use-current-prompt choice, multiline editing, and explicit conversation-image/frame choices when attachments are available.
+- Display friendly model names (H3 Image, Image 2.6 Sunburst / Flare, Qwen Image, H3, LTX 2.5) without changing API model identifiers or selected wire values.
+- Show image, image-edit, and video generation status directly in chat from the tool call onward, retaining a processing state after foreground polling times out.
+- Stream generated S3 videos through a TLS 1.2 Host route with Range / HEAD support to avoid direct Electron TLS resets; add playback retry without resubmitting generation or saving the entire video locally.
+- Add MiniMax H3 Image (`minimax_h3_image`) and GPT Image 2.6 Sunburst / Flare to both text-to-image and image-editing wizards and tools.
+- Select image options by model: H3 Image supports confirmed 1k / 2k resolution with 2k selected by default; Image2.6 exposes only exact 1:1, 3:2, and 2:3 static ratios and uses PNG / auto quality / high complexity.
+- Send H3 Image references without the unsupported type field and preserve existing image model request bodies. Set defaults to H3 Image for generation, Qwen Image for editing, and H3 for video.
+- Remove LTX 2.3 and both Seedance models from generation, retaining MiniMax H3 and LTX 2.5 in that order. Normalize stored removed-model defaults to H3 without changing profile files, discard incompatible historical settings, and reject explicit removed-model requests.
+- Preserve bilingual UI, default selection, Skip / cancel behavior, confirmation binding, uploads, task recovery, and inline media results; add regression coverage for the new model contracts.
+- Advance immediately after every single-choice click, including the last question in a group; guard duplicate submissions and complete the wizard without a final parameter-review page.
+- Add an inline-image preview with fit-to-window, actual size, zoom, scrolling, and Escape / close-button dismissal while retaining the independent download action.
+
+## 0.3.13
+
+- Add Chinese and English marketplace names and summaries through the package's `tokenscowork` metadata so Community Plugin Market follows the active TokensCowork language.
+- Preserve the 0.3.12 Host/Client bundles, generation behavior, and supported runtime ranges.
+
 ## 0.3.12
 
 - Preserve the published 0.3.11 signed `Host` validation and all existing model, confirmation, and request contracts.

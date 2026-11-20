@@ -11,48 +11,43 @@ import { Readable } from "node:stream";
 // src/shared/media.ts
 import { readFile, stat } from "node:fs/promises";
 import { extname } from "node:path";
-var IMAGE_MODELS = ["image2", "z_image_turbo", "qwen_image"];
-var IMAGE_EDIT_MODELS = ["image2", "qwen_image"];
+var IMAGE2_26_MODELS = ["gpt-image-2.6-sunburst", "gpt-image-2.6-flare"];
+var IMAGE_MODELS = ["z_image_turbo", "qwen_image", "minimax_h3_image", ...IMAGE2_26_MODELS];
+var IMAGE_EDIT_MODELS = ["qwen_image", "minimax_h3_image", ...IMAGE2_26_MODELS];
 var IMAGE_ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"];
+var IMAGE2_26_ASPECT_RATIOS = ["1:1", "3:2", "2:3"];
+var IMAGE_RESOLUTIONS = ["1k", "2k"];
 var LTX_VIDEO_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"];
-var SEEDANCE_2_5_ASPECT_RATIOS = [...LTX_VIDEO_ASPECT_RATIOS, "adaptive"];
 var MINIMAX_H3_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "3:2", "2:3"];
-var VIDEO_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "3:2", "2:3", "adaptive"];
-var DURATIONS = [3, 5, 8, 10, 15];
-var SEEDANCE_RESOLUTIONS = ["480p", "720p", "1080p"];
+var VIDEO_ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "3:2", "2:3"];
+var DURATIONS = [5, 10];
+var VIDEO_RESOLUTIONS = ["480p", "720p", "1080p"];
 var ASPECT_RATIOS = LTX_VIDEO_ASPECT_RATIOS;
+var IMAGE_EDIT_ASPECT_RATIOS = [...ASPECT_RATIOS, "3:2", "2:3"];
+var IMAGE_MODEL_CAPABILITIES = {
+  z_image_turbo: { aspectRatios: IMAGE_ASPECT_RATIOS },
+  qwen_image: { aspectRatios: IMAGE_ASPECT_RATIOS, editAspectRatios: ASPECT_RATIOS },
+  minimax_h3_image: {
+    aspectRatios: IMAGE_ASPECT_RATIOS,
+    editAspectRatios: IMAGE_ASPECT_RATIOS,
+    resolutions: IMAGE_RESOLUTIONS,
+    defaultResolution: "2k"
+  },
+  "gpt-image-2.6-sunburst": { aspectRatios: IMAGE2_26_ASPECT_RATIOS, editAspectRatios: IMAGE2_26_ASPECT_RATIOS },
+  "gpt-image-2.6-flare": { aspectRatios: IMAGE2_26_ASPECT_RATIOS, editAspectRatios: IMAGE2_26_ASPECT_RATIOS }
+};
+function imageModelCapability(model) {
+  return IMAGE_MODEL_CAPABILITIES[model];
+}
+function imageAspectRatios(model, editing = false) {
+  const capability = imageModelCapability(model);
+  return editing ? capability.editAspectRatios ?? [] : capability.aspectRatios;
+}
 var VIDEO_MODEL_IDS = [
   "minimax_h3",
-  "ltx_2_5",
-  "ltx_2_3",
-  "seedance_2_5",
-  "seedance_2_0"
+  "ltx_2_5"
 ];
 var VIDEO_MODEL_CAPABILITIES = {
-  ltx_2_3: {
-    durations: [3, 5, 8],
-    resolutions: ["720p"],
-    aspectRatios: LTX_VIDEO_ASPECT_RATIOS,
-    defaultDuration: 5,
-    defaultResolution: "720p",
-    defaultAspectRatio: "16:9",
-    defaultAudioEnabled: true,
-    audioMode: "required",
-    generateAudioParameter: "omit",
-    inputModes: ["text", "first_frame", "first_last_frame"]
-  },
-  seedance_2_0: {
-    durations: [5, 8, 10, 15],
-    resolutions: ["480p", "720p", "1080p"],
-    aspectRatios: LTX_VIDEO_ASPECT_RATIOS,
-    defaultDuration: 5,
-    defaultResolution: "720p",
-    defaultAspectRatio: "16:9",
-    defaultAudioEnabled: true,
-    audioMode: "optional",
-    generateAudioParameter: "optional",
-    inputModes: ["text", "first_frame", "first_last_frame"]
-  },
   ltx_2_5: {
     durations: [5, 10],
     resolutions: ["720p", "1080p"],
@@ -64,22 +59,6 @@ var VIDEO_MODEL_CAPABILITIES = {
     audioMode: "required",
     generateAudioParameter: "required_true",
     inputModes: ["text", "first_frame", "first_last_frame"]
-  },
-  seedance_2_5: {
-    durations: [5, 8, 10, 15],
-    resolutions: ["720p", "1080p"],
-    aspectRatios: SEEDANCE_2_5_ASPECT_RATIOS,
-    defaultDuration: 5,
-    defaultResolution: "720p",
-    defaultAspectRatio: "16:9",
-    defaultAudioEnabled: true,
-    audioMode: "optional",
-    generateAudioParameter: "optional",
-    inputModes: ["text", "first_frame", "first_last_frame"],
-    requiredAspectRatioByInputMode: {
-      first_frame: "adaptive",
-      first_last_frame: "adaptive"
-    }
   },
   minimax_h3: {
     durations: [5, 10],
@@ -1082,6 +1061,83 @@ ${canonicalJson(body)}`);
   }
 };
 
+// src/host/video-stream.ts
+import { request as httpsRequest2 } from "node:https";
+var VIDEO_STREAM_ROUTE = "/media-gen/video-stream";
+function registerVideoStreamRoute(ctx, request = httpsRequest2) {
+  ctx.effect(() => ctx.webServer.register({
+    kind: "exact",
+    path: VIDEO_STREAM_ROUTE,
+    handler(req, res) {
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.writeHead(405, { Allow: "GET, HEAD" });
+        res.end();
+        return;
+      }
+      let source;
+      try {
+        source = new URL(new URL(req.url, "http://dsh.local").searchParams.get("url") || "");
+      } catch {
+        res.writeHead(400);
+        res.end();
+        return;
+      }
+      if (source.protocol !== "https:" || source.hostname !== "s3.tokensapi.ai" || source.port || source.username || source.password) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+      const range = req.headers?.range;
+      if (range !== void 0 && (typeof range !== "string" || !/^bytes=(?:\d+-\d*|-\d+)$/.test(range))) {
+        res.writeHead(416);
+        res.end();
+        return;
+      }
+      const upstream = request(source, {
+        method: req.method,
+        minVersion: "TLSv1.2",
+        maxVersion: "TLSv1.2",
+        headers: { Accept: "video/mp4,video/webm,application/octet-stream", ...range ? { Range: range } : {} }
+      }, (response) => {
+        const status = response.statusCode ?? 502;
+        const headers = { "Cache-Control": "private, max-age=300" };
+        if (![200, 206, 416].includes(status)) {
+          response.resume();
+          res.writeHead(status >= 400 ? status : 502);
+          res.end();
+          return;
+        }
+        for (const name2 of ["content-type", "content-length", "content-range", "accept-ranges"]) {
+          const value = response.headers[name2];
+          if (value !== void 0) headers[name2] = value;
+        }
+        res.writeHead(status, headers);
+        if (req.method === "HEAD" || status === 416) {
+          response.resume();
+          res.end();
+          return;
+        }
+        response.on("error", () => res.destroy());
+        response.on("aborted", () => res.destroy());
+        response.pipe(res);
+      });
+      upstream.setTimeout(3e4, () => upstream.destroy(new Error("Video stream timed out")));
+      upstream.on("error", () => {
+        if (res.destroyed) return;
+        if (res.headersSent) res.destroy();
+        else {
+          res.writeHead(502);
+          res.end();
+        }
+      });
+      const stop = () => upstream.destroy();
+      req.once("aborted", stop);
+      res.once("close", stop);
+      upstream.end();
+    }
+  }), "media-gen: generated video stream");
+}
+
 // src/host/index.ts
 var name = "media-gen";
 var inject = ["tools", "credentials", "userQuestions", "systemPrompt", "attachments", "webServer"];
@@ -1091,9 +1147,19 @@ var Config = Schema.object({
   outputDir: Schema.string().default(join(homedir(), "Downloads", "dsh-media-gen")),
   pollIntervalMs: Schema.number().default(5e3),
   maxPollMs: Schema.number().default(12 * 60 * 1e3),
-  defaultImageModel: Schema.union([...IMAGE_MODELS]).default("z_image_turbo"),
-  defaultEditModel: Schema.union([...IMAGE_EDIT_MODELS]).default("qwen_image"),
-  defaultVideoModel: Schema.union([...VIDEO_MODELS]).default("minimax_h3"),
+  defaultImageModel: Schema.union([
+    ...IMAGE_MODELS,
+    Schema.transform(Schema.const("image2"), () => "minimax_h3_image")
+  ]).default("minimax_h3_image"),
+  defaultEditModel: Schema.union([
+    ...IMAGE_EDIT_MODELS,
+    Schema.transform(Schema.const("image2"), () => "qwen_image")
+  ]).default("qwen_image"),
+  defaultVideoModel: Schema.union([
+    ...VIDEO_MODELS,
+    // Accept stored legacy defaults without exposing these models to generation tools.
+    Schema.transform(Schema.union(["ltx_2_3", "seedance_2_5", "seedance_2_0"]), () => "minimax_h3")
+  ]).default("minimax_h3"),
   enhanceEnabled: Schema.boolean().default(true),
   enhanceApiKeyEnv: Schema.string().role("credential-ref").default("TOKENSAPI_API_KEY"),
   enhanceBaseURL: Schema.string().default("https://tokensapi.ai/v1"),
@@ -1165,8 +1231,8 @@ function isMediaTurnCancelled(exec) {
   return Boolean(identity && cancelledTurnByScope.get(identity.scope) === identity.turn);
 }
 var GENERATION_ARGUMENT_KEYS = {
-  image_gen: ["prompt", "model", "aspect_ratio", "n"],
-  image_edit: ["prompt", "image", "model", "aspect_ratio", "n"],
+  image_gen: ["prompt", "model", "aspect_ratio", "n", "resolution"],
+  image_edit: ["prompt", "image", "model", "aspect_ratio", "n", "resolution"],
   video_gen: ["prompt", "model", "duration", "resolution", "aspect_ratio", "generate_audio", "image_url", "reference_images", "start_image", "end_image"]
 };
 function generationArguments(intent, values) {
@@ -1195,9 +1261,21 @@ function issueGenerationPermit(intent, params, exec) {
   generationPermits.set(`${turnKey}:${intent}`, {
     intent,
     turnKey,
-    expectedArgs: generationArguments(intent, params),
+    expectedArgs: structuredClone(generationArguments(intent, params)),
     expiresAt: Date.now() + GENERATION_CONFIRMATION_TTL_MS
   });
+}
+function recoverConfirmedGenerationArgs(intent, args, exec) {
+  cleanupGenerationPermits();
+  if (isMediaTurnCancelled(exec)) return args;
+  const turnKey = mediaTurnIdentity(exec)?.key;
+  const permit = turnKey ? generationPermits.get(`${turnKey}:${intent}`) : void 0;
+  if (!permit || permit.intent !== intent || permit.turnKey !== turnKey) return args;
+  const recovered = { ...args };
+  for (const [key, value] of Object.entries(permit.expectedArgs)) {
+    if (recovered[key] === void 0) recovered[key] = structuredClone(value);
+  }
+  return recovered;
 }
 function assertGenerationPermit(intent, args, exec) {
   cleanupGenerationPermits();
@@ -1374,6 +1452,20 @@ function numberLabel(value) {
   return match ? Number(match[1]) : void 0;
 }
 var MEDIA_QUESTION_ID_PREFIX = "tokensapi_media__";
+var MEDIA_CANCEL_ANSWER = "tokensapi_media__cancelled_by_user__";
+var MEDIA_MODEL_NAMES = {
+  z_image_turbo: "Z-Image Turbo",
+  qwen_image: "Qwen Image",
+  minimax_h3_image: "H3 Image",
+  "gpt-image-2.6-sunburst": "Image 2.6 Sunburst",
+  "gpt-image-2.6-flare": "Image 2.6 Flare",
+  minimax_h3: "MiniMax H3",
+  ltx_2_5: "LTX 2.5"
+};
+function modelOptionLabel(label) {
+  const model = stripRecommended(label);
+  return `${MEDIA_MODEL_NAMES[model] ?? model}${model === label ? "" : "\uFF08\u63A8\u8350\uFF09"}`;
+}
 function mediaQuestionWireId(question, index) {
   const options = Array.isArray(question.options) ? question.options : [];
   const initialSelected = Array.isArray(question.initialSelected) ? question.initialSelected : [];
@@ -1382,16 +1474,36 @@ function mediaQuestionWireId(question, index) {
 }
 async function ask(ctx, exec, questions) {
   const logicalIdByWireId = /* @__PURE__ */ new Map();
+  const originalLabelsByWireId = /* @__PURE__ */ new Map();
   const wireQuestions = questions.map((question, index) => {
     const logicalId = String(question.id);
     const wireId = mediaQuestionWireId(question, index);
     logicalIdByWireId.set(wireId, logicalId);
+    if (logicalId === "model") {
+      const labels = new Map((question.options ?? []).map((option) => [modelOptionLabel(option.label), option.label]));
+      originalLabelsByWireId.set(wireId, labels);
+      return {
+        ...question,
+        id: wireId,
+        options: question.options.map((option) => ({ ...option, label: modelOptionLabel(option.label) })),
+        initialSelected: (question.initialSelected ?? []).map(modelOptionLabel)
+      };
+    }
     return { ...question, id: wireId };
   });
   const response = await ctx.userQuestions.ask({ questions: wireQuestions, ...exec.agent ? { agent: exec.agent } : {}, signal: exec.signal });
+  if ((response.answers ?? []).some((answer) => logicalIdByWireId.has(String(answer.id)) && answer.custom === MEDIA_CANCEL_ANSWER && !answer.selected?.length)) {
+    throw Object.assign(new Error("Media wizard cancelled by user"), { code: "ASK_CANCELLED" });
+  }
   return Object.fromEntries((response.answers ?? []).map((answer) => {
     const logicalId = logicalIdByWireId.get(String(answer.id)) ?? String(answer.id);
-    return [logicalId, { ...answer, id: logicalId }];
+    const labels = originalLabelsByWireId.get(String(answer.id));
+    return [logicalId, {
+      ...answer,
+      id: logicalId,
+      selected: (answer.selected ?? []).map((label) => labels?.get(label) ?? label),
+      ...answer.custom ? { custom: labels?.get(answer.custom) ?? answer.custom } : {}
+    }];
   }));
 }
 function sessionUserImageRefs(exec) {
@@ -1406,6 +1518,14 @@ function sessionUserImageRefs(exec) {
     }
   }
   return refs;
+}
+function sessionImageChoices(exec) {
+  const refs = sessionUserImageRefs(exec);
+  if (!refs.length) return {};
+  return {
+    options: refs.map((_ref, index) => ({ label: `dsh-attachment:${index + 1}`, description: describeSessionImageSelector(String(index + 1)) })),
+    initialSelected: [`dsh-attachment:${refs.length}`]
+  };
 }
 function resolveSessionImageRef(exec, selector) {
   const refs = sessionUserImageRefs(exec);
@@ -1448,16 +1568,27 @@ function resolveEffectiveVideoModel(params, config) {
   if (!VIDEO_MODELS.includes(model)) throw new Error(`Unsupported video model: ${model}`);
   return model;
 }
+function resolveEffectiveImageModel(intent, params, config) {
+  const model = params.model ?? defaultModelForIntent(intent, config);
+  if (!supportedModelsForIntent(intent).includes(model)) throw new Error(`Unsupported image model for ${intent}: ${model}`);
+  return model;
+}
+function imageRequestOptions(model, params) {
+  if (model === "minimax_h3_image") return { resolution: params.resolution };
+  if (IMAGE2_26_MODELS.includes(model)) {
+    return { quality: "auto", complexity: "high", output_format: "png" };
+  }
+  return {};
+}
+function assertImageResolution(model, params) {
+  if (imageModelCapability(model).resolutions && !params.resolution) {
+    throw new Error("Missing confirmed resolution; image task was not submitted.");
+  }
+}
 function videoInputMode(params) {
   if (params.end_image) return "first_last_frame";
   if (params.start_image || params.image_url) return "first_frame";
   return "text";
-}
-function videoAudioDescription(model, generateAudio) {
-  const capability = videoModelCapability(model);
-  if (capability.audioMode === "required") return "\u81EA\u52A8\u751F\u6210\u97F3\u9891\uFF08\u6A21\u578B\u56FA\u5B9A\u5F00\u542F\uFF09";
-  if (capability.audioMode === "not_configurable") return "\u7531\u6A21\u578B\u5DE5\u4F5C\u6D41\u51B3\u5B9A";
-  return generateAudio === false ? "\u5173\u95ED" : "\u5F00\u542F";
 }
 function videoModelDescription(model) {
   const capability = videoModelCapability(model);
@@ -1477,8 +1608,8 @@ var REFERENCE_REUSE_KEYS = {
   video_gen: ["image_url", "start_image", "end_image"]
 };
 var SETTINGS_REUSE_KEYS = {
-  image_gen: ["model", "useDefaultModel", "aspect_ratio", "n"],
-  image_edit: ["model", "useDefaultModel", "aspect_ratio", "n"],
+  image_gen: ["model", "useDefaultModel", "aspect_ratio", "n", "resolution"],
+  image_edit: ["model", "useDefaultModel", "aspect_ratio", "n", "resolution"],
   video_gen: ["model", "useDefaultModel", "aspect_ratio", "duration", "resolution", "generate_audio"]
 };
 function normalizeReuseDecisions(value) {
@@ -1555,7 +1686,15 @@ function mergeReusableValues(params, values) {
 }
 function pruneIncompatibleReusedSettings(intent, params, reusedKeys, config) {
   const supportedModels = supportedModelsForIntent(intent);
-  if (reusedKeys.has("model") && params.model && !supportedModels.includes(params.model)) delete params.model;
+  if (reusedKeys.has("model") && params.model && !supportedModels.includes(params.model)) {
+    for (const key of reusedKeys) delete params[key];
+  }
+  if (intent !== "video_gen" && (params.model || params.useDefaultModel === true)) {
+    const model = resolveEffectiveImageModel(intent, params, config);
+    const capability = imageModelCapability(model);
+    if (reusedKeys.has("aspect_ratio") && params.aspect_ratio && !imageAspectRatios(model, intent === "image_edit").includes(params.aspect_ratio)) delete params.aspect_ratio;
+    if (reusedKeys.has("resolution") && params.resolution && !capability.resolutions?.includes(params.resolution)) delete params.resolution;
+  }
   if (intent === "video_gen") {
     const model = resolveEffectiveVideoModel(params, config);
     const capability = videoModelCapability(model);
@@ -1608,9 +1747,14 @@ function validateWizardKnown(intent, params, config) {
     throw new Error(`Model ${params.model} is not supported for ${intent}. Choose one of: ${supportedModels.join(", ")}.`);
   }
   if (intent !== "video_gen") {
-    const ratios = intent === "image_gen" ? IMAGE_ASPECT_RATIOS : ASPECT_RATIOS;
+    const model = params.model || params.useDefaultModel === true ? resolveEffectiveImageModel(intent, params, config) : void 0;
+    const ratios = model ? imageAspectRatios(model, intent === "image_edit") : intent === "image_gen" ? IMAGE_ASPECT_RATIOS : IMAGE_EDIT_ASPECT_RATIOS;
     if (params.aspect_ratio && !ratios.includes(params.aspect_ratio)) {
-      throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported for ${intent}. Choose one of: ${ratios.join(", ")}.`);
+      throw new Error(`Aspect ratio ${params.aspect_ratio} is not supported for ${model ?? intent}. Choose one of: ${ratios.join(", ")}.`);
+    }
+    const resolutions = model ? imageModelCapability(model).resolutions : IMAGE_RESOLUTIONS;
+    if (params.resolution && !resolutions?.includes(params.resolution)) {
+      throw new Error(`Resolution ${params.resolution} is not supported for ${model ?? intent}.`);
     }
   }
   if ((intent === "image_gen" || intent === "image_edit") && params.n !== void 0 && ![1, 2, 4].includes(params.n)) {
@@ -1747,23 +1891,24 @@ async function prepareInput(config, api, input, exec, attachments) {
 function apply(ctx, config) {
   const api = new TokensApiClient(ctx, config);
   registerDownloadRoute(ctx);
+  registerVideoStreamRoute(ctx);
   registerVideoRoute(ctx, config);
   const attachments = ctx.get("attachments");
   const register = (spec) => ctx.tools.register(defineTool(spec));
   ctx.systemPrompt.section({
     name: "media-gen:wizard",
     order: 200,
-    text: `Before calling media_wizard, infer the user's media intent and separate current-request parameters from reusable historical context. media_wizard is a missing-parameter completer and reuse-consent gate, not a fixed questionnaire.
+    text: `Before calling media_wizard, infer the user's media intent and separate current-request parameters from reusable historical context. media_wizard always shows a prompt-entry card after any necessary reuse consent, then completes missing parameters. Do not bypass this card even when known.prompt is supplied.
 
 Infer intent from the requested outcome; the user does not need to say "generate an image" or "edit an image". Put only values supplied by the current user request, its newly attached media, or an explicit reuse instruction into known. Do not silently copy a previous task's prompt, reference images, model, aspect ratio, count, duration, resolution, or audio choice into known. When the most recent completed task of the same intent contains potentially reusable values that the current request did not explicitly supply, put its intent and final params into previousTask instead. The wizard will ask for consent before merging them.
 
 For image editing, when the current request itself contains one unambiguous target image, pass image: "dsh-attachment:latest" and use the current requested change as prompt. When the user refers to an ordered image, use dsh-attachment:1, dsh-attachment:2, first, last, index:N, or a current-conversation attachment id. If multiple images exist and the target or role is ambiguous, leave image absent. Never invent a local path or URL for a chat attachment.
 
-Known-field contract: prompt is the current requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when explicitly chosen; model is present only for an explicit supported model choice; useDefaultModel is true only after an explicit default-model choice; aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived from the current request. Set skipFinalConfirmation only when explicitly requested.
+Known-field contract: prompt is the current requested content or edit; promptSource is user or inferred when supplied before the wizard; enhanced is a boolean only when explicitly chosen; model is present only for an explicit supported model choice; useDefaultModel is true only after an explicit default-model choice; aspect_ratio, n, duration, resolution, generate_audio, image_url, start_image, end_image, and reference_images are supplied only when stated or unambiguously derived from the current request. Option selection advances immediately. Once all required choices are complete, proceed to generation without asking for a final parameter review or another confirmation. The legacy skipFinalConfirmation field is accepted but no longer changes this behavior.
 
 Reuse contract: previousTask contains only the most recent completed same-intent task and its final params. reuse contains explicit per-category decisions only when the user already said whether to reuse prompt, references, or settings. Use true for explicit reuse and false for explicit reset. Leave a category absent when the request is ambiguous, such as "generate another video", so the wizard asks. Phrases such as "another identical one" can set all available categories true; "do not reuse anything" can set them false; "change the content but keep other settings" should set prompt false and settings true. Current known values always win over reused values.
 
-The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. If the wizard result has cancelled=true, stop the media flow for this user request: do not reopen the wizard and do not call any media_generate_* tool until the user sends a new request. The plugin tracks successful confirmation internally for the current user request; do not invent or pass a confirmation id. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, and n exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
+The wizard must complete any remaining confirmation flow before media_generate_image, media_edit_image, or media_generate_video. Never call a final media tool unless the wizard result has confirmed=true. If the wizard result has cancelled=true, stop the media flow for this user request: do not reopen the wizard and do not call any media_generate_* tool until the user sends a new request. The plugin tracks successful confirmation internally for the current user request; do not invent or pass a confirmation id. Treat the confirmed wizard result.params as the authoritative handoff: copy prompt, aspect_ratio, n, and resolution (when present for H3 Image) exactly to image tools; copy prompt, duration, resolution, aspect_ratio, generate_audio, and any selected frame-image fields exactly to the video tool. Do not omit, infer, replace, or silently default these confirmed values between the wizard and the final tool. The plugin can recover an omitted optional field only from this request's live confirmed record, never from a guessed default or another request. Explicit value changes remain errors. If the user chooses the plugin default model, do not pass model to the final generation tool; only pass model after an explicit model choice.
 
 Submission safety contract: a network error, HTTP 429, unchanged progress, a timed-out foreground wait, or a result attachment warning does not authorize another generation submission. If a generation result includes a taskId, timedOut, recoverable, says the submission status is uncertain, or reports an attachment warning, do not call a media_generate_* tool again for that request. Continue with media_task_status using the same taskId and media kind. The recovery tool keeps polling the existing image or video task and retries generated-image attachment downloads; it never creates a replacement generation task. The plugin reuses the same in-process idempotency operation for an uncertain identical request; never change parameters merely to force a retry.`
   });
@@ -1822,7 +1967,7 @@ Submission safety contract: a network error, HTTP 429, unchanged progress, a tim
             `Prompt confirmed: ${value.promptConfirmed ? "yes" : "no"}`,
             `Model choice confirmed: ${value.modelChoiceConfirmed ? "yes" : "no"}`,
             `Model strategy: ${value.modelExplicit ? "explicit model" : "plugin default"}`,
-            `Final confirmation: ${value.finalConfirmed ? "yes" : "no"}`,
+            `Parameters complete: ${value.finalConfirmed ? "yes" : "no"}`,
             `Flow cancelled: ${value.cancelled ? "yes" : "no"}`,
             `Reuse decisions: ${JSON.stringify(value.reuseDecisions ?? {})}`,
             `Parameters:
@@ -1919,12 +2064,37 @@ ${JSON.stringify(value.params ?? {}, null, 2)}`
         validateWizardKnown(intent, params, config);
         const promptProvidedBeforeWizard = Boolean(params.prompt);
         if (promptProvidedBeforeWizard && !params.promptSource) params.promptSource = "user";
+        const promptAnswers = await ask(ctx, exec, [{
+          id: "prompt",
+          header: "\u539F\u59CB Prompt",
+          question: intent === "image_edit" ? "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u600E\u4E48\u4FEE\u6539\u56FE\u7247" : intent === "video_gen" ? "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u751F\u6210\u7684\u89C6\u9891" : "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u751F\u6210\u7684\u56FE\u7247",
+          ...params.prompt ? {
+            detail: `\u5F53\u524D Prompt
+\u6765\u6E90\uFF1A${promptSourceDescription(params.promptSource)}
+
+${params.prompt}`,
+            options: [{ label: "\u4F7F\u7528\u5F53\u524D\u63D0\u793A\u8BCD", description: "\u76F4\u63A5\u4F7F\u7528\u4E0A\u65B9\u5185\u5BB9\uFF1B\u4E5F\u53EF\u5728\u4E0B\u65B9\u8F93\u5165\u4FEE\u6539\u540E\u7684\u63D0\u793A\u8BCD" }],
+            initialSelected: ["\u4F7F\u7528\u5F53\u524D\u63D0\u793A\u8BCD"]
+          } : {}
+        }]);
+        const promptAnswer = promptAnswers.prompt;
+        const promptChoice = selected(promptAnswer);
+        if (!promptChoice) return result();
+        if (!(params.prompt && !promptAnswer?.custom?.trim() && promptChoice === "\u4F7F\u7528\u5F53\u524D\u63D0\u793A\u8BCD")) {
+          params.prompt = promptChoice.trim();
+          params.promptSource = "wizard";
+          if (params.originalPrompt) {
+            delete params.originalPrompt;
+            delete params.enhanced;
+          }
+        }
         if (intent === "image_edit" && !params.image) {
           const imageCount = sessionUserImageRefs(exec).length;
           const answers = await ask(ctx, exec, [{
             id: "image",
             header: "\u53C2\u8003\u56FE",
-            question: imageCount > 0 ? `\u5386\u53F2\u56FE\u7247\u4E0D\u4F1A\u81EA\u52A8\u590D\u7528\u3002\u8BF7\u660E\u786E\u8F93\u5165 dsh-attachment:1 \u81F3 dsh-attachment:${imageCount}\uFF0C\u6216\u63D0\u4F9B HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84` : "\u5F53\u524D\u5BF9\u8BDD\u4E2D\u6CA1\u6709\u7528\u6237\u4E0A\u4F20\u7684\u56FE\u7247\u3002\u8BF7\u8F93\u5165 HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84"
+            question: imageCount > 0 ? `\u5386\u53F2\u56FE\u7247\u4E0D\u4F1A\u81EA\u52A8\u590D\u7528\u3002\u8BF7\u660E\u786E\u8F93\u5165 dsh-attachment:1 \u81F3 dsh-attachment:${imageCount}\uFF0C\u6216\u63D0\u4F9B HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84` : "\u5F53\u524D\u5BF9\u8BDD\u4E2D\u6CA1\u6709\u7528\u6237\u4E0A\u4F20\u7684\u56FE\u7247\u3002\u8BF7\u8F93\u5165 HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84",
+            ...sessionImageChoices(exec)
           }]);
           params.image = selected(answers.image);
           if (!params.image) {
@@ -1934,12 +2104,12 @@ ${JSON.stringify(value.params ?? {}, null, 2)}`
         }
         if (intent === "video_gen") {
           const hasInput = params.image_url || params.start_image || params.end_image || Array.isArray(params.reference_images) && params.reference_images.length;
-          if (!hasInput && !params.prompt) {
+          if (!hasInput && !promptProvidedBeforeWizard) {
             const answers = await ask(ctx, exec, [{ id: "video_input", header: "\u89C6\u9891\u7C7B\u578B", question: "\u9009\u62E9\u89C6\u9891\u751F\u6210\u65B9\u5F0F", options: [{ label: "\u7EAF\u6587\u751F\u89C6\u9891" }, { label: "\u4F7F\u7528\u9996\u5E27\u56FE\u7247" }, { label: "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247" }], initialSelected: ["\u7EAF\u6587\u751F\u89C6\u9891"] }]);
             const choice = stripRecommended(selected(answers.video_input));
             if (!choice) return result();
             if (choice === "\u4F7F\u7528\u9996\u5E27\u56FE\u7247") {
-              const imageAnswers = await ask(ctx, exec, [{ id: "start_image", header: "\u9996\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5DF2\u9644\u52A0\u7684\u9996\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" }]);
+              const imageAnswers = await ask(ctx, exec, [{ id: "start_image", header: "\u9996\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5DF2\u9644\u52A0\u7684\u9996\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84", ...sessionImageChoices(exec) }]);
               params.start_image = selected(imageAnswers.start_image);
               if (!params.start_image) {
                 needsImage = true;
@@ -1948,8 +2118,8 @@ ${JSON.stringify(value.params ?? {}, null, 2)}`
             }
             if (choice === "\u4F7F\u7528\u9996\u5E27\u548C\u5C3E\u5E27\u56FE\u7247") {
               const imageAnswers = await ask(ctx, exec, [
-                { id: "start_image", header: "\u9996\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u9996\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" },
-                { id: "end_image", header: "\u5C3E\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5C3E\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84" }
+                { id: "start_image", header: "\u9996\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u9996\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84", ...sessionImageChoices(exec) },
+                { id: "end_image", header: "\u5C3E\u5E27\u56FE\u7247", question: "\u8BF7\u9009\u62E9\u5C3E\u5E27\u56FE\u7247\uFF0C\u6216\u8F93\u5165 dsh-attachment \u9009\u62E9\u5668 / HTTPS URL / \u672C\u5730\u56FE\u7247\u8DEF\u5F84", ...sessionImageChoices(exec) }
               ]);
               params.start_image = selected(imageAnswers.start_image);
               params.end_image = selected(imageAnswers.end_image);
@@ -1959,13 +2129,6 @@ ${JSON.stringify(value.params ?? {}, null, 2)}`
               }
             }
           }
-        }
-        if (!params.prompt) {
-          const answers = await ask(ctx, exec, [{ id: "prompt", header: "\u539F\u59CB Prompt", question: intent === "image_edit" ? "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u600E\u4E48\u4FEE\u6539\u56FE\u7247" : intent === "video_gen" ? "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u751F\u6210\u7684\u89C6\u9891" : "\u8BF7\u63CF\u8FF0\u4F60\u60F3\u751F\u6210\u7684\u56FE\u7247" }]);
-          params.prompt = selected(answers.prompt);
-          if (!params.prompt) return result();
-          params.prompt = String(params.prompt).trim();
-          params.promptSource = "wizard";
         }
         if (params.enhanced === true && !config.enhanceEnabled) throw new Error("Prompt enhancement was requested, but enhancement is disabled by plugin configuration.");
         if (params.enhanced === true && !params.originalPrompt) {
@@ -2000,12 +2163,12 @@ ${params.prompt}`,
         }
         const promptWasEnhanced = Boolean(params.originalPrompt && params.prompt !== params.originalPrompt);
         if (promptWasEnhanced) {
-          const promptAnswers = await ask(ctx, exec, [{ id: "prompt_confirm", header: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt", question: "Prompt \u5DF2\u88AB\u589E\u5F3A\uFF0C\u662F\u5426\u4F7F\u7528\u589E\u5F3A\u540E\u7684\u5185\u5BB9\uFF1F", detail: `\u539F\u59CB Prompt:
+          const promptAnswers2 = await ask(ctx, exec, [{ id: "prompt_confirm", header: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt", question: "Prompt \u5DF2\u88AB\u589E\u5F3A\uFF0C\u662F\u5426\u4F7F\u7528\u589E\u5F3A\u540E\u7684\u5185\u5BB9\uFF1F", detail: `\u539F\u59CB Prompt:
 ${params.originalPrompt}
 
 \u589E\u5F3A\u540E Prompt:
 ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" }, { label: "\u53D6\u6D88" }], initialSelected: ["\u786E\u8BA4\u589E\u5F3A\u540E Prompt"] }]);
-          promptConfirmed = stripRecommended(selected(promptAnswers.prompt_confirm)) === "\u786E\u8BA4\u589E\u5F3A\u540E Prompt";
+          promptConfirmed = stripRecommended(selected(promptAnswers2.prompt_confirm)) === "\u786E\u8BA4\u589E\u5F3A\u540E Prompt";
         } else promptConfirmed = Boolean(params.prompt);
         if (!promptConfirmed) return cancelResult();
         const selectableModels = supportedModelsForIntent(intent);
@@ -2039,6 +2202,11 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
             modelExplicit = true;
           }
         }
+        pruneIncompatibleReusedSettings(intent, params, reusedSettingKeys, config);
+        validateWizardKnown(intent, params, config);
+        const effectiveImageModel = intent !== "video_gen" ? resolveEffectiveImageModel(intent, params, config) : void 0;
+        const imageCapability = effectiveImageModel ? imageModelCapability(effectiveImageModel) : void 0;
+        const imageRatios = effectiveImageModel ? imageAspectRatios(effectiveImageModel, intent === "image_edit") : void 0;
         const effectiveVideoModel = intent === "video_gen" ? resolveEffectiveVideoModel(params, config) : void 0;
         const videoCapability = effectiveVideoModel ? videoModelCapability(effectiveVideoModel) : void 0;
         const selectedVideoInputMode = intent === "video_gen" ? videoInputMode(params) : void 0;
@@ -2049,8 +2217,8 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
           if (videoCapability.audioMode === "required" && params.generate_audio === void 0) params.generate_audio = true;
         }
         const outputQuestions = [];
-        if (intent === "image_gen" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: IMAGE_ASPECT_RATIOS.map((ratio) => ({ label: ratio })), initialSelected: [IMAGE_ASPECT_RATIOS[0]] });
-        if (intent === "image_edit" && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: ASPECT_RATIOS.map((ratio) => ({ label: ratio })), initialSelected: [ASPECT_RATIOS[0]] });
+        if (imageRatios && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: imageRatios.map((ratio) => ({ label: ratio })), initialSelected: [imageRatios[0]] });
+        if (imageCapability?.resolutions && !params.resolution) outputQuestions.push({ id: "resolution", header: "\u5206\u8FA8\u7387", question: "\u9009\u62E9\u56FE\u7247\u5206\u8FA8\u7387", options: imageCapability.resolutions.map((resolution) => ({ label: resolution })), initialSelected: [imageCapability.defaultResolution] });
         if (intent === "video_gen" && videoCapability && selectedVideoInputMode && !params.aspect_ratio) outputQuestions.push({ id: "aspect_ratio", header: "\u753B\u9762\u6BD4\u4F8B", question: "\u9009\u62E9\u753B\u9762\u6BD4\u4F8B", options: videoCapability.aspectRatios.map((ratio) => {
           const label = videoAspectRatioLabel(ratio, selectedVideoInputMode);
           return { label };
@@ -2069,33 +2237,10 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
         }
         validateWizardKnown(intent, params, config);
         const videoParametersPresent = videoCapability ? Boolean(params.duration) && Boolean(params.resolution) && (videoCapability.audioMode !== "optional" || typeof params.generate_audio === "boolean") : false;
-        const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === "video_gen" ? videoParametersPresent : Boolean(params.n));
+        const imageParametersPresent = Boolean(params.n) && (!imageCapability?.resolutions || Boolean(params.resolution));
+        const requiredParametersPresent = Boolean(params.aspect_ratio) && (intent === "video_gen" ? videoParametersPresent : imageParametersPresent);
         if (!requiredParametersPresent) return result();
-        const taskLabel = intent === "image_edit" ? "\u56FE\u7247\u7F16\u8F91" : intent === "video_gen" ? "\u89C6\u9891\u751F\u6210" : "\u56FE\u7247\u751F\u6210";
-        const inputLines = intent === "image_edit" ? [`- \u53C2\u8003\u56FE: ${describeImageInput(params.image)}`] : intent === "video_gen" ? [
-          ...params.start_image || params.image_url ? [`- \u9996\u5E27\u56FE\u7247: ${describeImageInput(params.start_image ?? params.image_url)}`] : [],
-          ...params.end_image ? [`- \u5C3E\u5E27\u56FE\u7247: ${describeImageInput(params.end_image)}`] : [],
-          ...Array.isArray(params.reference_images) && params.reference_images.length ? [`- \u53C2\u8003\u56FE\u7247: ${params.reference_images.map(describeImageInput).join(", ")}`] : []
-        ] : [];
-        const parameterLines = [
-          `- \u4EFB\u52A1: ${taskLabel}`,
-          ...inputLines,
-          `- \u5185\u5BB9: ${params.prompt}`,
-          `- Prompt \u6765\u6E90: ${params.promptSource ?? (promptProvidedBeforeWizard ? "user" : "wizard")}`,
-          `- Prompt \u589E\u5F3A: ${promptWasEnhanced ? "\u5DF2\u589E\u5F3A" : "\u672A\u589E\u5F3A"}`,
-          `- \u6A21\u578B: ${params.model ?? defaultModel}`,
-          `- \u753B\u9762\u6BD4\u4F8B: ${intent === "video_gen" && selectedVideoInputMode ? videoAspectRatioLabel(params.aspect_ratio, selectedVideoInputMode) : params.aspect_ratio}`,
-          ...params.duration ? [`- \u65F6\u957F: ${params.duration} \u79D2`] : [],
-          ...intent === "video_gen" && videoCapability ? [`- \u5206\u8FA8\u7387: ${params.resolution ?? videoCapability.defaultResolution}`] : [],
-          ...intent === "video_gen" && effectiveVideoModel ? [`- \u97F3\u9891: ${videoAudioDescription(effectiveVideoModel, params.generate_audio)}`] : [],
-          ...params.n ? [`- \u6570\u91CF: ${params.n} \u5F20`] : []
-        ];
-        if (params.skipFinalConfirmation === true) finalConfirmed = true;
-        else {
-          const finalAnswers = await ask(ctx, exec, [{ id: "final_confirm", header: "\u6700\u7EC8\u786E\u8BA4", question: "\u6309\u4EE5\u4E0B\u5B8C\u6574\u914D\u7F6E\u521B\u5EFA\u4EFB\u52A1\u5417\uFF1F", detail: parameterLines.join("\n"), options: [{ label: "\u786E\u8BA4\u751F\u6210" }, { label: "\u53D6\u6D88" }], initialSelected: ["\u786E\u8BA4\u751F\u6210"] }]);
-          finalConfirmed = stripRecommended(selected(finalAnswers.final_confirm)) === "\u786E\u8BA4\u751F\u6210";
-        }
-        if (!finalConfirmed) return cancelResult();
+        finalConfirmed = true;
         issueGenerationPermit(intent, params, exec);
         return result();
       } catch (error) {
@@ -2111,7 +2256,8 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       prompt: { type: "string", required: true },
       model: { type: "string", enum: [...IMAGE_MODELS] },
       aspect_ratio: { type: "string", enum: [...IMAGE_ASPECT_RATIOS], required: true },
-      n: { type: "integer", enum: [1, 2, 4], required: true }
+      n: { type: "integer", enum: [1, 2, 4], required: true },
+      resolution: { type: "string", enum: [...IMAGE_RESOLUTIONS], description: "For minimax_h3_image, including when it is the plugin default, copy the wizard-confirmed 1k or 2k value. An omitted value is recovered only from this request's live confirmed record. Omit for other image models." }
     },
     output: {
       schema: imageOutputSchema(),
@@ -2123,12 +2269,14 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       }
     },
     async execute(args, exec) {
-      const model = args.model ?? config.defaultImageModel;
+      args = recoverConfirmedGenerationArgs("image_gen", args, exec);
+      const model = resolveEffectiveImageModel("image_gen", args, config);
       if (!args.aspect_ratio) throw new Error("Missing confirmed aspect_ratio; image task was not submitted.");
       if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error("Missing or invalid confirmed n; image task was not submitted.");
+      assertImageResolution(model, args);
       assertGenerationPermit("image_gen", args, exec);
       validateWizardKnown("image_gen", { ...args, model }, config);
-      const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio, n: args.n };
+      const body = { model, prompt: args.prompt, aspect_ratio: args.aspect_ratio, n: args.n, ...imageRequestOptions(model, args) };
       const taskId = await api.submit("images", body, exec.signal, body);
       const data = await api.poll(taskId, exec.signal);
       const timedOut = data.timedOut === true;
@@ -2144,21 +2292,26 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       prompt: { type: "string", required: true },
       image: { type: "string", description: "Optional image source: dsh-attachment:latest, first, last, a 1-based selector such as dsh-attachment:2, index:N, a current-conversation attachment id, HTTPS URL, local path, or data URL. Defaults to the latest user-uploaded conversation image." },
       model: { type: "string", enum: [...IMAGE_EDIT_MODELS] },
-      aspect_ratio: { type: "string", enum: [...ASPECT_RATIOS], required: true },
-      n: { type: "integer", enum: [1, 2, 4], required: true }
+      aspect_ratio: { type: "string", enum: [...IMAGE_EDIT_ASPECT_RATIOS], required: true },
+      n: { type: "integer", enum: [1, 2, 4], required: true },
+      resolution: { type: "string", enum: [...IMAGE_RESOLUTIONS], description: "For minimax_h3_image, including when it is the plugin default, copy the wizard-confirmed 1k or 2k value. An omitted value is recovered only from this request's live confirmed record. Omit for other image models." }
     },
     output: {
       schema: imageOutputSchema(),
-      render: (_args, value) => imageBlocks(value.images, "Edited images", value.model, value.taskId)
+      render: (_args, value) => {
+        const blocks = imageBlocks(value.images, "Edited images", value.model, value.taskId);
+        const pending = pendingTaskBlock(value);
+        if (pending) blocks.push(pending);
+        return blocks;
+      }
     },
     async execute(args, exec) {
-      const model = args.model ?? config.defaultEditModel;
+      args = recoverConfirmedGenerationArgs("image_edit", args, exec);
+      const model = resolveEffectiveImageModel("image_edit", args, config);
       if (!args.aspect_ratio) throw new Error("Missing confirmed aspect_ratio; image edit task was not submitted.");
       if (!Number.isInteger(args.n) || ![1, 2, 4].includes(args.n)) throw new Error("Missing or invalid confirmed n; image edit task was not submitted.");
+      assertImageResolution(model, args);
       assertGenerationPermit("image_edit", args, exec);
-      if (!IMAGE_EDIT_MODELS.includes(model)) {
-        throw new Error(`Model ${model} does not support image editing. Choose image2 or qwen_image.`);
-      }
       validateWizardKnown("image_edit", { ...args, model }, config);
       const image = await prepareInput(config, api, args.image, exec, attachments);
       const body = {
@@ -2166,7 +2319,12 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
         prompt: args.prompt,
         n: args.n,
         aspect_ratio: args.aspect_ratio,
-        input_references: [{ type: "image_url", slot_name: "reference_1", image_url: { url: image } }]
+        ...imageRequestOptions(model, args),
+        input_references: [{
+          ...model === "minimax_h3_image" || IMAGE2_26_MODELS.includes(model) ? {} : { type: "image_url" },
+          slot_name: "reference_1",
+          image_url: { url: image }
+        }]
       };
       const deduplicationInput = { ...args, model, image: args.image ?? "dsh-attachment:latest" };
       const taskId = await api.submit("images", body, exec.signal, deduplicationInput);
@@ -2218,9 +2376,9 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
       prompt: { type: "string", required: true },
       model: { type: "string", enum: [...VIDEO_MODELS] },
       duration: { type: "integer", enum: [...DURATIONS], required: true },
-      resolution: { type: "string", enum: [...SEEDANCE_RESOLUTIONS], required: true },
+      resolution: { type: "string", enum: [...VIDEO_RESOLUTIONS], required: true },
       aspect_ratio: { type: "string", enum: [...VIDEO_ASPECT_RATIOS], required: true },
-      generate_audio: { type: "boolean", required: true, description: "Confirmed wizard audio value. Seedance exposes the switch; LTX 2.3, LTX 2.5, and MiniMax H3 require true." },
+      generate_audio: { type: "boolean", required: true, description: "Confirmed wizard audio value. LTX 2.5 and MiniMax H3 require true." },
       image_url: { type: "string", description: "Legacy first-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." },
       reference_images: { type: "array", items: { type: "string" }, description: "Reference image inputs support dsh-attachment selectors, although the current production video contract may reject generic references." },
       start_image: { type: "string", description: "First-frame input; supports dsh-attachment selectors, HTTPS URL, local path, or data URL." },
@@ -2228,7 +2386,8 @@ ${params.prompt}`, options: [{ label: "\u786E\u8BA4\u589E\u5F3A\u540E Prompt" },
     },
     output: { schema: videoSchema, render: renderVideo },
     async execute(args, exec) {
-      const model = args.model ?? config.defaultVideoModel;
+      args = recoverConfirmedGenerationArgs("video_gen", args, exec);
+      const model = resolveEffectiveVideoModel(args, config);
       const capability = videoModelCapability(model);
       const firstInput = args.start_image ?? args.image_url;
       if (args.end_image && !firstInput) throw new Error("end_image requires start_image or image_url");
@@ -2377,6 +2536,9 @@ Video models: ${value.videos.join(", ")}` }]
 }
 export {
   Config,
+  IMAGE_EDIT_MODELS,
+  IMAGE_MODELS,
+  IMAGE_MODEL_CAPABILITIES,
   TokensApiClient,
   VIDEO_MODELS,
   VIDEO_MODEL_CAPABILITIES,
@@ -2384,10 +2546,12 @@ export {
   apply,
   download as downloadGeneratedImage,
   downloadWithTls12,
+  imageModelCapability,
   inject,
   isVideoModel,
   name,
   parseImageUploadGrant,
+  registerVideoStreamRoute,
   saveImages,
   uploadObjectWithTls12,
   uploadObjectWithTlsRecovery,

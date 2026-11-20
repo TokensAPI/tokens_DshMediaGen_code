@@ -136,6 +136,13 @@ test('TokensCowork 0.7.13 promotes successful image and video results outside th
     data: { message: { source: { callId: 'other-call' }, content: [{ type: 'text', text: 'ordinary result' }] } },
   }), null)
   const initial = conversationDefinition.start({}, start)
+  const pendingNode = conversationDefinition.buildViewNode({
+    key: 'tokensapi-media-image-result:call-1', id: 'call-1', state: initial,
+    current: new Map(), start, matches: [start],
+  })
+  assert.equal(pendingNode.visibility, 'visible')
+  assert.equal(pendingNode.anchorSeq, 10)
+  assert.equal('kind' in pendingNode.data.block, false)
   const state = conversationDefinition.update({ state: initial }, update)
   const node = conversationDefinition.buildViewNode({
     key: 'tokensapi-media-image-result:call-1',
@@ -148,6 +155,8 @@ test('TokensCowork 0.7.13 promotes successful image and video results outside th
   assert.equal(node.kind, 'tokensapi-media-image-result')
   assert.equal(node.groupTree, 'turn')
   assert.equal(node.visibility, 'visible')
+  assert.equal(node.key, pendingNode.key)
+  assert.equal(node.anchorSeq, pendingNode.anchorSeq)
   assert.equal(node.data.block.content[0].attachment.attachmentId, 'image-1')
   assert.ok(registrations.has('tokensapi-media-image-result'))
   const toolRow = registrations.get('media_generate_image').component({
@@ -179,6 +188,12 @@ test('TokensCowork 0.7.13 promotes successful image and video results outside th
   assert.equal(videoUpdateRoute.id, 'video-call-1')
   assert.equal(videoUpdateRoute.role, 'update')
   const videoInitial = videoDefinition.start({}, videoStart)
+  const pendingVideoNode = videoDefinition.buildViewNode({
+    key: 'tokensapi-media-video-result:video-call-1', id: 'video-call-1', state: videoInitial,
+    current: new Map(), start: videoStart, matches: [videoStart],
+  })
+  assert.equal(pendingVideoNode.visibility, 'visible')
+  assert.equal('kind' in pendingVideoNode.data.block, false)
   const videoState = videoDefinition.update({ state: videoInitial }, videoUpdate)
   const videoNode = videoDefinition.buildViewNode({
     key: 'tokensapi-media-video-result:video-call-1',
@@ -198,4 +213,28 @@ test('TokensCowork 0.7.13 promotes successful image and video results outside th
     block: videoNode.data.block,
   })
   assert.equal(videoToolRow.props.promoted, true)
+
+  // Error and delayed results must replace the visible pending state too.
+  for (const def of [conversationDefinition, videoDefinition]) {
+    for (const isError of [true, false]) {
+      const event = { type: 'tool/result', seq: 30, time: 300, data: { message: {
+        source: { callId: 'call-1' }, isError,
+        content: [{ type: 'text', text: isError ? 'fetch failed' : 'Task retained-id is still running (30%).' }],
+      } } }
+      assert.equal(def.match(event).role, 'update')
+      const state = def.update({ state: def === videoDefinition ? videoInitial : initial }, { event })
+      const node = def.buildViewNode({ key: 'same-card', id: 'call-1', state, current: new Map(), start, matches: [start, { event }] })
+      assert.equal(node.visibility, 'visible')
+      assert.equal(node.data.block.isError, isError)
+    }
+  }
+  for (const kind of ['images', 'videos', 'auto']) {
+    const match = { event: { type: 'tool/call', seq: 40, data: { name: 'media_task_status', callId: 'status-1', arguments: JSON.stringify({ kind }) } } }
+    const nodes = [conversationDefinition, videoDefinition].map((def) => {
+      const state = def.start({}, match)
+      return def.buildViewNode({ key: def.kind, id: 'status-1', state, current: new Map(), start: match, matches: [match] })
+    })
+    assert.equal(nodes.filter(Boolean).length, kind === 'auto' ? 0 : 1)
+    if (kind !== 'auto') assert.equal(nodes[kind === 'images' ? 0 : 1].visibility, 'visible')
+  }
 })

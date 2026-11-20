@@ -1,23 +1,55 @@
 import { readFile, stat } from 'node:fs/promises'
 import { extname } from 'node:path'
 
-export const IMAGE_MODELS = ['image2', 'z_image_turbo', 'qwen_image'] as const
-export const IMAGE_EDIT_MODELS = ['image2', 'qwen_image'] as const
+export const IMAGE2_26_MODELS = ['gpt-image-2.6-sunburst', 'gpt-image-2.6-flare'] as const
+export const IMAGE_MODELS = ['z_image_turbo', 'qwen_image', 'minimax_h3_image', ...IMAGE2_26_MODELS] as const
+export const IMAGE_EDIT_MODELS = ['qwen_image', 'minimax_h3_image', ...IMAGE2_26_MODELS] as const
 export const IMAGE_ASPECT_RATIOS = ['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3'] as const
+export const IMAGE2_26_ASPECT_RATIOS = ['1:1', '3:2', '2:3'] as const
+export const IMAGE_RESOLUTIONS = ['1k', '2k'] as const
 export const LTX_VIDEO_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'] as const
-export const SEEDANCE_2_5_ASPECT_RATIOS = [...LTX_VIDEO_ASPECT_RATIOS, 'adaptive'] as const
 export const MINIMAX_H3_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '3:2', '2:3'] as const
-export const VIDEO_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9', '3:2', '2:3', 'adaptive'] as const
-export const DURATIONS = [3, 5, 8, 10, 15] as const
-export const SEEDANCE_RESOLUTIONS = ['480p', '720p', '1080p'] as const
+export const VIDEO_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9', '3:2', '2:3'] as const
+export const DURATIONS = [5, 10] as const
+export const VIDEO_RESOLUTIONS = ['480p', '720p', '1080p'] as const
 export const ASPECT_RATIOS = LTX_VIDEO_ASPECT_RATIOS
+export const IMAGE_EDIT_ASPECT_RATIOS = [...ASPECT_RATIOS, '3:2', '2:3'] as const
+
+export type ImageModel = typeof IMAGE_MODELS[number]
+export type ImageEditModel = typeof IMAGE_EDIT_MODELS[number]
+
+export interface ImageModelCapability {
+  aspectRatios: readonly string[]
+  editAspectRatios?: readonly string[]
+  resolutions?: readonly string[]
+  defaultResolution?: string
+}
+
+export const IMAGE_MODEL_CAPABILITIES = {
+  z_image_turbo: { aspectRatios: IMAGE_ASPECT_RATIOS },
+  qwen_image: { aspectRatios: IMAGE_ASPECT_RATIOS, editAspectRatios: ASPECT_RATIOS },
+  minimax_h3_image: {
+    aspectRatios: IMAGE_ASPECT_RATIOS,
+    editAspectRatios: IMAGE_ASPECT_RATIOS,
+    resolutions: IMAGE_RESOLUTIONS,
+    defaultResolution: '2k',
+  },
+  'gpt-image-2.6-sunburst': { aspectRatios: IMAGE2_26_ASPECT_RATIOS, editAspectRatios: IMAGE2_26_ASPECT_RATIOS },
+  'gpt-image-2.6-flare': { aspectRatios: IMAGE2_26_ASPECT_RATIOS, editAspectRatios: IMAGE2_26_ASPECT_RATIOS },
+} as const satisfies Record<ImageModel, ImageModelCapability>
+
+export function imageModelCapability(model: ImageModel): ImageModelCapability {
+  return IMAGE_MODEL_CAPABILITIES[model]
+}
+
+export function imageAspectRatios(model: ImageModel, editing = false): readonly string[] {
+  const capability = imageModelCapability(model)
+  return editing ? capability.editAspectRatios ?? [] : capability.aspectRatios
+}
 
 export const VIDEO_MODEL_IDS = [
   'minimax_h3',
   'ltx_2_5',
-  'ltx_2_3',
-  'seedance_2_5',
-  'seedance_2_0',
 ] as const
 
 export type VideoModel = typeof VIDEO_MODEL_IDS[number]
@@ -40,30 +72,6 @@ export interface VideoModelCapability {
 }
 
 export const VIDEO_MODEL_CAPABILITIES = {
-  ltx_2_3: {
-    durations: [3, 5, 8],
-    resolutions: ['720p'],
-    aspectRatios: LTX_VIDEO_ASPECT_RATIOS,
-    defaultDuration: 5,
-    defaultResolution: '720p',
-    defaultAspectRatio: '16:9',
-    defaultAudioEnabled: true,
-    audioMode: 'required',
-    generateAudioParameter: 'omit',
-    inputModes: ['text', 'first_frame', 'first_last_frame'],
-  },
-  seedance_2_0: {
-    durations: [5, 8, 10, 15],
-    resolutions: ['480p', '720p', '1080p'],
-    aspectRatios: LTX_VIDEO_ASPECT_RATIOS,
-    defaultDuration: 5,
-    defaultResolution: '720p',
-    defaultAspectRatio: '16:9',
-    defaultAudioEnabled: true,
-    audioMode: 'optional',
-    generateAudioParameter: 'optional',
-    inputModes: ['text', 'first_frame', 'first_last_frame'],
-  },
   ltx_2_5: {
     durations: [5, 10],
     resolutions: ['720p', '1080p'],
@@ -75,22 +83,6 @@ export const VIDEO_MODEL_CAPABILITIES = {
     audioMode: 'required',
     generateAudioParameter: 'required_true',
     inputModes: ['text', 'first_frame', 'first_last_frame'],
-  },
-  seedance_2_5: {
-    durations: [5, 8, 10, 15],
-    resolutions: ['720p', '1080p'],
-    aspectRatios: SEEDANCE_2_5_ASPECT_RATIOS,
-    defaultDuration: 5,
-    defaultResolution: '720p',
-    defaultAspectRatio: '16:9',
-    defaultAudioEnabled: true,
-    audioMode: 'optional',
-    generateAudioParameter: 'optional',
-    inputModes: ['text', 'first_frame', 'first_last_frame'],
-    requiredAspectRatioByInputMode: {
-      first_frame: 'adaptive',
-      first_last_frame: 'adaptive',
-    },
   },
   minimax_h3: {
     durations: [5, 10],
@@ -107,8 +99,6 @@ export const VIDEO_MODEL_CAPABILITIES = {
 } as const satisfies Record<VideoModel, VideoModelCapability>
 
 export const VIDEO_MODELS = VIDEO_MODEL_IDS
-
-export type ImageModel = typeof IMAGE_MODELS[number]
 
 export function isVideoModel(value: unknown): value is VideoModel {
   return typeof value === 'string' && (VIDEO_MODEL_IDS as readonly string[]).includes(value)
