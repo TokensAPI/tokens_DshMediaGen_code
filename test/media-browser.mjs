@@ -219,8 +219,8 @@ try {
        await page.waitForFunction(id=>document.querySelector('section[data-media-question]')?.dataset.mediaQuestion===id,q.id)
        const defaultIndex=Number(/__d(-?\d+)__/.exec(q.id)[1])
        assert.ok(defaultIndex>=0,`${intent}: ${q.id} must have a default`)
-       const choice=page.locator('button[aria-pressed="true"]')
-       assert.equal(await choice.count(),1)
+       const choice=page.locator('button[data-media-option]').nth(defaultIndex)
+       assert.equal(await choice.getAttribute('aria-pressed'),'true')
        expected.push([q.options[defaultIndex].label])
        await choice.click()
      }
@@ -239,6 +239,116 @@ try {
  await page.getByRole('button',{name:/Image 2.6 Flare/}).click()
  await page.waitForFunction(count=>window.__answers.length===count+1,beforeFlare)
  assert.deepEqual(await page.evaluate(()=>window.__answers.at(-1).answers[0].selected),['Image 2.6 Flare'])
+ // Hover changes the actual answer without advancing; Space then confirms it.
+ // Exercise every real image/edit/video question in both client languages.
+ for(const intent of ['image_gen','image_edit','video_gen']) {
+   for(const language of ['zh','en']) {
+     for(const q of hostQuestionSets[intent]) {
+       await page.mouse.move(0,0)
+       const before=await page.evaluate(()=>window.__answers.length)
+       await page.evaluate(({intent,language,q})=>window.__hostChoices(intent,language,[q]),{intent,language,q})
+       await page.waitForFunction(id=>document.querySelector('section[data-media-question]')?.dataset.mediaQuestion===id,q.id)
+       const defaultIndex=Number(/__d(-?\d+)__/.exec(q.id)[1])
+       const targetIndex=(defaultIndex+1)%q.options.length
+       const options=page.locator('button[data-media-option]')
+       await options.nth(targetIndex).hover()
+       await page.waitForFunction(index=>document.querySelectorAll('button[data-media-option]')[index]?.getAttribute('aria-pressed')==='true',targetIndex)
+       assert.equal(await page.locator('button[data-media-option][aria-pressed="true"]').count(),1)
+       assert.equal(await page.evaluate(()=>window.__answers.length),before,'hover must not submit')
+       await page.getByRole('heading').hover()
+       assert.equal(await options.nth(targetIndex).getAttribute('aria-pressed'),'true','selection survives mouse leave')
+       await page.keyboard.press('Space')
+       await page.waitForFunction(count=>window.__answers.length===count+1,before)
+       assert.deepEqual(await page.evaluate(()=>window.__answers.at(-1).answers),[{id:q.id,selected:[q.options[targetIndex].label]}])
+     }
+   }
+ }
+ const keyboardQuestions=[
+   {id:'tokensapi_media__q0__d0__model',question:'选择模型',options:[{label:'minimax_h3_image'},{label:'qwen_image'}]},
+   {id:'tokensapi_media__q1__d0__n',question:'生成几张？',options:[{label:'1 张'},{label:'2 张'}]},
+ ]
+ await page.mouse.move(0,0)
+ const beforeHeldKey=await page.evaluate(()=>window.__answers.length)
+ await page.evaluate(q=>window.__choices(q,'en'),keyboardQuestions)
+ await page.locator('button[data-media-option]').nth(1).hover()
+ await page.keyboard.down('Space')
+ await page.waitForFunction(id=>document.querySelector('section[data-media-question]')?.dataset.mediaQuestion===id,keyboardQuestions[1].id)
+ // Layout can put a new option under the same pointer without mouse movement.
+ await page.locator('button[data-media-option]').nth(1).dispatchEvent('mouseover')
+ await page.keyboard.down('Space')
+ await page.keyboard.up('Space')
+ assert.equal(await page.evaluate(()=>window.__answers.length),beforeHeldKey,'held Space must not skip another step')
+ await page.locator('button[data-media-next]').focus()
+ await page.keyboard.press('Space')
+ await page.waitForFunction(count=>window.__answers.length===count+1,beforeHeldKey)
+ assert.deepEqual(await page.evaluate(()=>window.__answers.at(-1).answers.map(a=>a.selected)),[['qwen_image'],['1 张']])
+ for(const language of ['zh','en']) {
+   await page.mouse.move(0,0)
+   const before=await page.evaluate(()=>window.__answers.length)
+   const q={id:'tokensapi_media__q0__d1__resolution',question:'选择图片分辨率',options:[{label:'1k'},{label:'2k'}]}
+   await page.evaluate(({q,language})=>window.__choices([q],language),{q,language})
+   const option=page.locator('button[data-media-option]').first()
+   await option.focus()
+   assert.equal(await option.getAttribute('aria-pressed'),'true')
+   await page.keyboard.down('Space');await page.keyboard.down('Space');await page.keyboard.up('Space')
+   await page.waitForFunction(count=>window.__answers.length===count+1,before)
+   assert.deepEqual(await page.evaluate(()=>window.__answers.at(-1).answers),[{id:q.id,selected:['1k']}])
+ }
+ // A continuous hover event and immediate key event must use the fresh draft,
+ // even when React has not yet committed its visual update.
+ await page.mouse.move(0,0)
+ const beforeImmediate=await page.evaluate(()=>window.__answers.length)
+ await page.evaluate(()=>window.__h3Resolution('en'))
+ await page.locator('button[data-media-option]').first().evaluate(button=>{
+   button.dispatchEvent(new PointerEvent('pointermove',{pointerType:'mouse',bubbles:true}))
+   button.closest('section').dispatchEvent(new KeyboardEvent('keydown',{key:' ',code:'Space',bubbles:true,cancelable:true}))
+ })
+ await page.waitForFunction(count=>window.__answers.length===count+1,beforeImmediate)
+ assert.deepEqual(await page.evaluate(()=>window.__answers.at(-1).answers[0].selected),['1k'])
+ for(const language of ['zh','en']) {
+   await page.mouse.move(0,0)
+   const before=await page.evaluate(()=>window.__answers.length)
+   await page.evaluate(language=>window.__prompt(language),language)
+   const input=page.getByRole('textbox')
+   await input.fill('A');await input.press('Space');await input.press('Enter');await page.keyboard.insertText('blue bird')
+   assert.equal(await input.inputValue(),'A \nblue bird')
+   assert.equal(await page.evaluate(()=>window.__answers.length),before,'typing whitespace must not advance')
+   await input.press('Control+Enter')
+   await page.waitForFunction(count=>window.__answers.length===count+1,before)
+   assert.equal(await page.evaluate(()=>window.__answers.at(-1).answers[0].custom),'A \nblue bird')
+ }
+ await page.mouse.move(0,0)
+ const beforeOther=await page.evaluate(()=>window.__answers.length)
+ await page.evaluate(()=>window.__choices([{id:'tokensapi_media__q0__d0__aspect_ratio',question:'选择画面比例',options:[{label:'1:1'},{label:'16:9'}]}],'en'))
+ const customInput=page.getByRole('textbox')
+ await customInput.fill('3:2');await customInput.press('Space')
+ assert.equal(await customInput.inputValue(),'3:2 ')
+ assert.equal(await page.evaluate(()=>window.__answers.length),beforeOther)
+ await page.locator('button[data-media-next]').focus();await page.keyboard.press('Space')
+ await page.waitForFunction(count=>window.__answers.length===count+1,beforeOther)
+ assert.equal(await page.evaluate(()=>window.__answers.at(-1).answers[0].custom),'3:2')
+ await page.mouse.move(0,0)
+ const beforeIme=await page.evaluate(()=>window.__answers.length)
+ await page.evaluate(()=>window.__h3Resolution('en'))
+ await page.locator('section[data-media-question]').evaluate(card=>{
+   for(const modifiers of [{isComposing:true},{ctrlKey:true},{metaKey:true},{altKey:true},{shiftKey:true},{repeat:true}])
+     card.dispatchEvent(new KeyboardEvent('keydown',{key:' ',code:'Space',bubbles:true,cancelable:true,...modifiers}))
+ })
+ assert.equal(await page.evaluate(()=>window.__answers.length),beforeIme,'IME, modified keys and repeat must not advance')
+ await page.keyboard.press('Enter')
+ await page.waitForFunction(count=>window.__answers.length===count+1,beforeIme)
+ await page.mouse.move(0,0)
+ const beforeMulti=await page.evaluate(()=>window.__answers.length)
+ await page.evaluate(()=>window.__choices([{id:'tokensapi_media__q0__d0__references',question:'References',multiSelect:true,options:[{label:'First'},{label:'Second'}]}],'en'))
+ const second=page.locator('button[data-media-option]').nth(1)
+ await second.hover()
+ assert.equal(await second.getAttribute('aria-pressed'),'false','hover must not toggle multi-select values')
+ await second.focus();await page.keyboard.press('Space')
+ await page.waitForFunction(()=>document.querySelectorAll('button[data-media-option][aria-pressed="true"]').length===2)
+ assert.equal(await page.evaluate(()=>window.__answers.length),beforeMulti)
+ await page.locator('button[data-media-next]').focus();await page.keyboard.press('Space')
+ await page.waitForFunction(count=>window.__answers.length===count+1,beforeMulti)
+ assert.deepEqual(await page.evaluate(()=>window.__answers.at(-1).answers[0].selected),['First','Second'])
  for(const intent of ['image_gen','image_edit','video_gen']) {
    for(const q of hostQuestionSets[intent]) {
      const before=await page.evaluate(()=>window.__answers.length)
@@ -253,5 +363,5 @@ try {
  assert.equal(await page.evaluate(()=>window.__hidden),0,'X must cancel instead of dismissing/hiding a modern card')
  assert.deepEqual(errors,[])
  await page.evaluate(()=>window.__dispose())
- console.log('Media browser passed: actual Host questions + actual desktop PendingQuestion + native composer competition through SlotCore; every image/edit/video choice defaults and advances, canonical names, modern X cancellation without hiding; legacy bilingual flow, MP4 playback/retry, status, scoped images, preview/download. No generation or profile writes.')
+ console.log('Media browser passed: actual Host questions + actual desktop PendingQuestion + native composer competition through SlotCore; every image/edit/video choice defaults, selects on hover, and advances by click or Space; retained hover values, held-key and duplicate protection, input/IME/multi-select behavior; canonical names, modern X cancellation without hiding; legacy bilingual flow, MP4 playback/retry, status, scoped images, preview/download. No generation or profile writes.')
 } finally {await browser?.close();await new Promise(resolve=>server.close(resolve))}

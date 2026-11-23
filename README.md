@@ -6,7 +6,7 @@ This package is maintained under the `@tokensapi` npm scope and is derived from 
 
 ## Compatibility
 
-Version `0.3.14` declares compatibility with the DSH runtime lines used by supported TokensCowork releases:
+Version `0.3.15` declares compatibility with the DSH runtime lines used by supported TokensCowork releases:
 
 - DeepSeek Harness / DSH `0.1.0-rc.8`, `0.1.3-alpha.1`, `^0.1.5-rc.2` (TokensCowork 0.5.25), and `0.2.1-rc.2` (TokensCowork 0.7.13 / 0.7.18)
 - Cordis `>=4.0.1 <5`
@@ -64,7 +64,7 @@ Local images and current-conversation DSH attachments use first-party storage. S
 Install from the TokensAPI private registry for your TokensCowork organization:
 
 ```bash
-npm install @tokensapi/dsh-media-gen@0.3.14 --registry=https://npm.tokensapi.ai/
+npm install @tokensapi/dsh-media-gen@0.3.15 --registry=https://npm.tokensapi.ai/
 ```
 
 Register the package in the active DSH profile:
@@ -130,7 +130,7 @@ pnpm run pack:dry
 
 ## Limitations
 
-- Version `0.3.14` supports the declared DSH runtime lines above; other prerelease lines require separate validation.
+- Version `0.3.15` supports the declared DSH runtime lines above; other prerelease lines require separate validation.
 - DSH `rc.8` has no video attachment type. The plugin therefore serves saved MP4 files through a restricted same-origin `/media-gen/videos/` route with byte-range support; remote TokensAPI URLs remain the fallback.
 - Public generation task endpoints do not directly accept Data URLs. Local images are converted and sent through TokensAPI presigned object storage before task submission.
 - Submission recovery state is currently process-local and is not written to a task journal. Restarting DSH/TokensCowork clears uncertain submissions that never returned a `task_id`; known task IDs remain recoverable when retained in conversation history.

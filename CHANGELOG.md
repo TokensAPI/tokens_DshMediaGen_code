@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.15
+
+- Select single-choice media options on mouse hover, retaining the selected value after the pointer leaves without advancing the wizard.
+- Let Space / Enter advance from the card, selected option, or Next button using the latest choice. Preserve text entry and IME shortcuts, ignore held-key repeats, and guard duplicate submissions.
+
 ## 0.3.14
 
 - Remove legacy Image 2 (`image2`) from image-generation/editing choices, discovery, and tool schemas while preserving Image 2.6 Sunburst / Flare. Normalize stored legacy defaults to H3 Image / Qwen Image in memory and discard incompatible historical settings before re-selection.

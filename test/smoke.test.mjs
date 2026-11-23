@@ -30,7 +30,7 @@ test('package metadata covers supported TokensCowork runtimes without the obsole
     '@deepseek-ai/dsh-client-ui-tool',
   ]
 
-  assert.equal(pkg.version, '0.3.14')
+  assert.equal(pkg.version, '0.3.15')
   assert.ok(pkg.files.includes('docs/tokenscowork-0.5.25-0.7.13-compatibility.md'))
   assert.equal(pkg.dsh.engine, supportedRange)
   assert.equal(pkg.engines.dsh, supportedRange)
